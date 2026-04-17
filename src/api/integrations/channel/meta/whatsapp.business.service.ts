@@ -10,6 +10,7 @@ import {
   SendLocationDto,
   SendMediaDto,
   SendReactionDto,
+  SendStickerDto,
   SendTemplateDto,
   SendTextDto,
 } from '@api/dto/sendMessage.dto';
@@ -1048,6 +1049,19 @@ export class BusinessStartupService extends ChannelStartupService {
           quoted ? (content.context = { message_id: quoted.id }) : content;
           return await this.post(content, 'messages');
         }
+        if (message['sticker']) {
+          content = {
+            messaging_product: 'whatsapp',
+            recipient_type: 'individual',
+            type: 'sticker',
+            to: number.replace(/\D/g, ''),
+            sticker: {
+              [message['type']]: message['id'],
+            },
+          };
+          quoted ? (content.context = { message_id: quoted.id }) : content;
+          return await this.post(content, 'messages');
+        }
         if (message['buttons']) {
           content = {
             messaging_product: 'whatsapp',
@@ -1644,10 +1658,54 @@ export class BusinessStartupService extends ChannelStartupService {
     throw new BadRequestException('Method not available on WhatsApp Business API');
   }
 
-  // methods not available on WhatsApp Business API
-  public async mediaSticker() {
-    throw new BadRequestException('Method not available on WhatsApp Business API');
+  protected async prepareStickerMessage(stickerSource: string) {
+    try {
+      const prepareMedia: any = {
+        fileName: 'sticker.webp',
+        mediaType: 'sticker',
+        media: stickerSource,
+        mimetype: 'image/webp',
+      };
+
+      if (isURL(stickerSource)) {
+        prepareMedia.id = stickerSource;
+        prepareMedia.type = 'link';
+      } else {
+        const id = await this.getIdMedia(prepareMedia);
+        prepareMedia.id = id;
+        prepareMedia.type = 'id';
+      }
+
+      return prepareMedia;
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException(error?.toString() || error);
+    }
   }
+
+  public async mediaSticker(data: SendStickerDto, file?: any) {
+    const stickerData: SendStickerDto = { ...data };
+
+    if (file) stickerData.sticker = file.buffer.toString('base64');
+
+    const message = await this.prepareStickerMessage(stickerData.sticker);
+
+    const stickerSent = await this.sendMessageWithTyping(
+      data.number,
+      { ...message, sticker: stickerData.sticker },
+      {
+        delay: data?.delay,
+        presence: 'composing',
+        quoted: data?.quoted,
+        mentionsEveryOne: data?.mentionsEveryOne,
+        mentioned: data?.mentioned,
+      },
+    );
+
+    return stickerSent;
+  }
+
+  // methods not available on WhatsApp Business API
   public async pollMessage() {
     throw new BadRequestException('Method not available on WhatsApp Business API');
   }
