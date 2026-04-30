@@ -4,6 +4,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { wa } from '@api/types/wa.types';
 import { configService, Log, Webhook } from '@config/env.config';
 import { Logger } from '@config/logger.config';
+import { instanceTracker } from '@forensic/instance-tracker';
 // import { BadRequestException } from '@exceptions';
 import axios, { AxiosInstance } from 'axios';
 import * as jwt from 'jsonwebtoken';
@@ -220,8 +221,18 @@ export class WebhookController extends EventController implements EventControlle
     let attempts = 0;
 
     while (attempts < maxRetryAttempts) {
+      const t0 = Date.now();
       try {
-        await httpService.post('', webhookData);
+        const resp = await httpService.post('', webhookData);
+        instanceTracker.recordWebhookDelivery(webhookData?.instance ?? null, {
+          url: baseURL,
+          event: webhookData?.event ?? 'unknown',
+          origin,
+          ok: true,
+          httpStatus: resp?.status ?? null,
+          latencyMs: Date.now() - t0,
+          attempt: attempts + 1,
+        });
         if (attempts > 0) {
           this.logger.log({
             local: `${origin}`,
@@ -234,6 +245,17 @@ export class WebhookController extends EventController implements EventControlle
         attempts++;
 
         const isTimeout = error.code === 'ECONNABORTED';
+
+        instanceTracker.recordWebhookDelivery(webhookData?.instance ?? null, {
+          url: baseURL,
+          event: webhookData?.event ?? 'unknown',
+          origin,
+          ok: false,
+          httpStatus: error?.response?.status ?? null,
+          latencyMs: Date.now() - t0,
+          attempt: attempts,
+          error: { code: error?.code, message: error?.message, isTimeout },
+        });
 
         if (error?.response?.status && nonRetryableStatusCodes.includes(error.response.status)) {
           this.logger.error({

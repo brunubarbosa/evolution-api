@@ -23,6 +23,7 @@
       "@cache/*": ["./src/cache/*"],
       "@config/*": ["./src/config/*"],
       "@exceptions": ["./src/exceptions"],
+      "@forensic/*": ["./src/forensic/*"],
       "@libs/*": ["./src/libs/*"],
       "@utils/*": ["./src/utils/*"],
       "@validate/*": ["./src/validate/*"]

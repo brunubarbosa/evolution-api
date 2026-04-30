@@ -54,6 +54,12 @@ COPY --from=builder /evolution/runWithProvider.js ./runWithProvider.js
 COPY --from=builder /evolution/tsup.config.ts ./tsup.config.ts
 
 ENV DOCKER_ENV=true
+ENV FORENSIC_LOG_DIR=/evolution/forensic
+
+# Forensic JSONL logs + state-snapshot.json. Mount this on a host volume in
+# Coolify so the files survive container rebuilds and we can inspect them
+# after the next silent disruption.
+VOLUME ["/evolution/forensic"]
 
 EXPOSE 8080
 

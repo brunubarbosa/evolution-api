@@ -77,6 +77,8 @@ import {
 } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException, NotFoundException } from '@exceptions';
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
+import { forensic } from '@forensic/forensic-logger';
+import { instanceTracker } from '@forensic/instance-tracker';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
@@ -332,6 +334,24 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+    // Forensic: log every transition with full lastDisconnect, not just on close.
+    try {
+      const err = lastDisconnect?.error as any;
+      instanceTracker.recordActivity(this.instance.name, 'connection.update', {
+        connection: connection ?? null,
+        hasQr: !!qr,
+        statusCode: err?.output?.statusCode ?? null,
+        errorMessage: err?.message ?? null,
+        errorName: err?.name ?? null,
+        boomData: err?.data ?? null,
+      });
+      if (connection) {
+        instanceTracker.setDbStatus(this.instance.name, connection === 'open' ? 'open' : connection);
+      }
+    } catch {
+      /* noop */
+    }
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -696,6 +716,50 @@ export class BaileysStartupService extends ChannelStartupService {
     this.endSession = false;
 
     this.client = makeWASocket(socketConfig);
+
+    // ── Forensic: register instance + raw WS lifecycle hooks ──
+    try {
+      const wsRef: any = this.client?.ws;
+      instanceTracker.register(this.instance.name, 'baileys', () => {
+        try {
+          return typeof wsRef?.readyState === 'number' ? wsRef.readyState : null;
+        } catch {
+          return null;
+        }
+      });
+      if (wsRef?.on) {
+        wsRef.on('open', () => {
+          instanceTracker.recordActivity(this.instance.name, 'ws.open');
+        });
+        wsRef.on('close', (code: number, reasonBuf: Buffer) => {
+          let reason: string | null = null;
+          try {
+            reason = reasonBuf?.toString?.() ?? null;
+          } catch {
+            /* noop */
+          }
+          instanceTracker.recordActivity(this.instance.name, 'ws.close', { code, reason });
+        });
+        wsRef.on('error', (err: Error) => {
+          instanceTracker.recordActivity(this.instance.name, 'ws.error', {
+            message: err?.message,
+            name: err?.name,
+            stack: err?.stack?.split('\n').slice(0, 6).join('\n'),
+          });
+        });
+        wsRef.on('message', () => {
+          // High-volume; do NOT log per-message. Just bump activity timestamp.
+          instanceTracker.recordActivity(this.instance.name, 'ws.message');
+        });
+      }
+    } catch (e) {
+      forensic({
+        kind: 'forensic.wire-error',
+        instance: this.instance.name,
+        where: 'ws-hooks',
+        error: (e as Error)?.message,
+      }).catch(() => {});
+    }
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
@@ -1876,6 +1940,18 @@ export class BaileysStartupService extends ChannelStartupService {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
+          // Forensic: bump activity for every distinct Baileys event key seen.
+          // This is the lifeline for "when did this socket actually go quiet?"
+          try {
+            for (const key of Object.keys(events)) {
+              instanceTracker.recordActivity(this.instance.name, key as any, {
+                count: Array.isArray((events as any)[key]) ? (events as any)[key].length : undefined,
+              });
+            }
+          } catch {
+            /* noop */
+          }
+
           if (!this.endSession) {
             const database = this.configService.get<Database>('DATABASE');
             const settings = await this.findSettings();

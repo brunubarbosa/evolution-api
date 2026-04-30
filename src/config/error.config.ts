@@ -1,4 +1,17 @@
+import { forensicSync, writeSnapshotSync } from '@forensic/forensic-logger';
+import { instanceTracker } from '@forensic/instance-tracker';
+
 import { Logger } from './logger.config';
+
+function captureFinalState(reason: string, extra?: Record<string, unknown>) {
+  try {
+    const snap = instanceTracker.snapshot();
+    writeSnapshotSync(snap);
+    forensicSync({ kind: `process.${reason}`, ...(extra ?? {}), snapshot: snap });
+  } catch {
+    /* noop */
+  }
+}
 
 export function onUnexpectedError() {
   process.on('uncaughtException', (error, origin) => {
@@ -7,6 +20,10 @@ export function onUnexpectedError() {
       origin,
       stderr: process.stderr.fd,
       error,
+    });
+    captureFinalState('uncaughtException', {
+      origin: String(origin),
+      error: { message: error?.message, name: error?.name, stack: error?.stack },
     });
   });
 
@@ -17,5 +34,31 @@ export function onUnexpectedError() {
       stderr: process.stderr.fd,
     });
     logger.error(error);
+    captureFinalState('unhandledRejection', {
+      reason: error instanceof Error ? { message: error.message, stack: error.stack } : error,
+    });
+  });
+
+  // Container stop / k8s terminate / Coolify redeploy
+  for (const sig of ['SIGTERM', 'SIGINT', 'SIGQUIT', 'SIGHUP'] as const) {
+    process.on(sig, () => {
+      captureFinalState('signal', { signal: sig });
+      // Don't call process.exit here — let the upstream shutdown logic run
+      // (Express server.close, prisma disconnect). We just need the forensic
+      // line written before the process actually exits.
+    });
+  }
+
+  process.on('beforeExit', (code) => {
+    captureFinalState('beforeExit', { code });
+  });
+
+  process.on('exit', (code) => {
+    // exit is fully synchronous — only forensicSync works here.
+    try {
+      forensicSync({ kind: 'process.exit', code });
+    } catch {
+      /* noop */
+    }
   });
 }

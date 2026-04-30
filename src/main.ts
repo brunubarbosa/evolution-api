@@ -18,6 +18,8 @@ import {
 import { onUnexpectedError } from '@config/error.config';
 import { Logger } from '@config/logger.config';
 import { ROOT_DIR } from '@config/path.config';
+import { forensic } from '@forensic/forensic-logger';
+import { instanceTracker } from '@forensic/instance-tracker';
 import * as Sentry from '@sentry/node';
 import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
@@ -162,6 +164,16 @@ async function bootstrap() {
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);
   });
+
+  // Forensic: start instance heartbeat + emit a boot line so we always have
+  // a known anchor point for "the process was alive at this minute".
+  instanceTracker.startHeartbeat();
+  forensic({
+    kind: 'process.boot',
+    nodeVersion: process.version,
+    httpPort: httpServer.PORT,
+    pid: process.pid,
+  }).catch(() => {});
 
   onUnexpectedError();
 }

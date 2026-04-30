@@ -23,6 +23,7 @@ import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, wa } from '@api/types/wa.types';
 import { AudioConverter, Chatwoot, ConfigService, Database, Openai, S3, WaBusiness } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException } from '@exceptions';
+import { instanceTracker } from '@forensic/instance-tracker';
 import { createJid } from '@utils/createJid';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -388,7 +389,9 @@ export class BusinessStartupService extends ChannelStartupService {
       let messageRaw: any;
       let pushName: any;
 
-      if (received.contacts) pushName = received.contacts[0].profile.name;
+      // Cloud API status events (read receipts) include `contacts` without `profile`,
+      // so guard the chain — this was producing recurring TypeError noise in logs.
+      if (received.contacts) pushName = received.contacts[0]?.profile?.name ?? null;
 
       if (received.messages) {
         const message = received.messages[0]; // Añadir esta línea para definir message
@@ -896,6 +899,20 @@ export class BusinessStartupService extends ChannelStartupService {
 
   protected async eventHandler(content: any) {
     try {
+      // Forensic: register & bump activity for the Cloud API channel.
+      try {
+        instanceTracker.register(this.instance.name, 'cloud');
+        instanceTracker.setDbStatus(this.instance.name, 'open');
+        const kind = content?.messages
+          ? `cloud.messages.${content.messages[0]?.type ?? 'unknown'}`
+          : content?.statuses
+            ? `cloud.statuses.${content.statuses[0]?.status ?? 'unknown'}`
+            : 'cloud.event';
+        instanceTracker.recordActivity(this.instance.name, 'cloud.event', { kind });
+      } catch {
+        /* noop */
+      }
+
       // Registro para depuración
       this.logger.log('Contenido recibido en eventHandler:');
       this.logger.log(JSON.stringify(content, null, 2));
