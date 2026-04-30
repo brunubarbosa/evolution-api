@@ -23,6 +23,13 @@ interface InstanceState {
   startedAt: number;
   lastActivityAt: number | null;
   lastActivityKind: string | null;
+  // G2: separate Baileys-event activity (messages/chats/contacts/creds)
+  // from raw ws.message frames. The 2026-04-30 zombie kept ws.message
+  // flowing while messages.upsert was frozen for 27min — same lastActivityAt
+  // hid the silence. Track them apart.
+  lastBaileysEventAt: number | null;
+  lastBaileysEventKind: string | null;
+  lastWsMessageAt: number | null;
   activityCounts: Record<string, number>;
   lastConnectionUpdateAt: number | null;
   lastConnectionUpdate: unknown;
@@ -34,11 +41,34 @@ interface InstanceState {
   lastWebhookDelivery: unknown;
   lastWebhookFailureAt: number | null;
   lastWebhookFailure: unknown;
+  // G4: handler-level rejections, e.g. fire-and-forget chats/contacts/groups
+  // handlers that throw async. Recording per-instance helps attribute
+  // unhandledRejections that don't carry their own context.
+  lastHandlerErrorAt: number | null;
+  lastHandlerError: unknown;
+  handlerErrorCount: number;
   dbStatus: string | null;
   // populated by getter functions registered from the service
   wsReadyState?: () => number | null;
-  // ms since last successful keep-alive — Baileys-side; we infer from activity gap
 }
+
+const BAILEYS_EVENT_KINDS = new Set<string>([
+  'messages.upsert',
+  'messages.update',
+  'messaging-history.set',
+  'message-receipt.update',
+  'chats.upsert',
+  'chats.update',
+  'chats.delete',
+  'contacts.upsert',
+  'contacts.update',
+  'creds.update',
+  'connection.update',
+  'presence.update',
+  'groups.upsert',
+  'groups.update',
+  'group-participants.update',
+]);
 
 const HEARTBEAT_MS = Number(process.env.FORENSIC_HEARTBEAT_MS) || 60_000;
 const ZOMBIE_GAP_MS = Number(process.env.FORENSIC_ZOMBIE_GAP_MS) || 10 * 60_000;
@@ -61,6 +91,9 @@ class InstanceTracker {
       startedAt: Date.now(),
       lastActivityAt: null,
       lastActivityKind: null,
+      lastBaileysEventAt: null,
+      lastBaileysEventKind: null,
+      lastWsMessageAt: null,
       activityCounts: {},
       lastConnectionUpdateAt: null,
       lastConnectionUpdate: null,
@@ -72,6 +105,9 @@ class InstanceTracker {
       lastWebhookDelivery: null,
       lastWebhookFailureAt: null,
       lastWebhookFailure: null,
+      lastHandlerErrorAt: null,
+      lastHandlerError: null,
+      handlerErrorCount: 0,
       dbStatus: null,
       wsReadyState,
     });
@@ -91,6 +127,13 @@ class InstanceTracker {
     s.lastActivityAt = now;
     s.lastActivityKind = kind;
     s.activityCounts[kind] = (s.activityCounts[kind] || 0) + 1;
+
+    if (kind === 'ws.message') {
+      s.lastWsMessageAt = now;
+    } else if (BAILEYS_EVENT_KINDS.has(kind)) {
+      s.lastBaileysEventAt = now;
+      s.lastBaileysEventKind = kind;
+    }
 
     if (kind === 'connection.update') {
       s.lastConnectionUpdateAt = now;
@@ -144,6 +187,22 @@ class InstanceTracker {
     if (s) s.dbStatus = status;
   }
 
+  recordHandlerError(
+    name: string | null | undefined,
+    detail: { handler: string; error: { message?: string; name?: string; stack?: string } },
+  ) {
+    const now = Date.now();
+    if (name) {
+      const s = this.map.get(name);
+      if (s) {
+        s.lastHandlerErrorAt = now;
+        s.lastHandlerError = detail;
+        s.handlerErrorCount += 1;
+      }
+    }
+    forensic({ kind: 'baileys.handler.error', instance: name ?? null, ...detail }).catch(() => {});
+  }
+
   snapshot() {
     const now = Date.now();
     const mem = process.memoryUsage();
@@ -161,11 +220,21 @@ class InstanceTracker {
       instances: Array.from(this.map.values()).map((s) => {
         const wsRs = s.wsReadyState?.() ?? null;
         const msSinceActivity = s.lastActivityAt ? now - s.lastActivityAt : null;
+        const msSinceBaileysEvent = s.lastBaileysEventAt ? now - s.lastBaileysEventAt : null;
+        const msSinceWsMessage = s.lastWsMessageAt ? now - s.lastWsMessageAt : null;
+        // G2: zombie criteria now keys off Baileys events, not raw ws frames.
+        // ws.message keeps flowing during a stalled event pipeline; only the
+        // gap on real Baileys events tells us the app logic is dead.
         const zombieSuspected =
+          s.dbStatus === 'open' && msSinceBaileysEvent !== null && msSinceBaileysEvent > ZOMBIE_GAP_MS;
+        // Strong signal: WS frames are arriving but Baileys events aren't
+        // being emitted — the exact pattern from the 2026-04-30 incident.
+        const stalledPipeline =
           s.dbStatus === 'open' &&
-          msSinceActivity !== null &&
-          msSinceActivity > ZOMBIE_GAP_MS &&
-          (wsRs === null || wsRs !== 1);
+          msSinceWsMessage !== null &&
+          msSinceWsMessage < 60_000 &&
+          msSinceBaileysEvent !== null &&
+          msSinceBaileysEvent > ZOMBIE_GAP_MS;
         return {
           name: s.name,
           channel: s.channel,
@@ -173,18 +242,25 @@ class InstanceTracker {
           wsReadyState: wsRs,
           uptimeSec: Math.round((now - s.startedAt) / 1000),
           lastActivityKind: s.lastActivityKind,
+          lastBaileysEventKind: s.lastBaileysEventKind,
           msSinceLastActivity: msSinceActivity,
+          msSinceLastBaileysEvent: msSinceBaileysEvent,
+          msSinceLastWsMessage: msSinceWsMessage,
           msSinceLastConnectionUpdate: s.lastConnectionUpdateAt ? now - s.lastConnectionUpdateAt : null,
           msSinceLastWsClose: s.lastWsCloseAt ? now - s.lastWsCloseAt : null,
           msSinceLastWebhookDelivery: s.lastWebhookDeliveryAt ? now - s.lastWebhookDeliveryAt : null,
           msSinceLastWebhookFailure: s.lastWebhookFailureAt ? now - s.lastWebhookFailureAt : null,
+          msSinceLastHandlerError: s.lastHandlerErrorAt ? now - s.lastHandlerErrorAt : null,
+          handlerErrorCount: s.handlerErrorCount,
           activityCounts: s.activityCounts,
           lastConnectionUpdate: s.lastConnectionUpdate,
           lastWsClose: s.lastWsClose,
           lastWsError: s.lastWsError,
           lastWebhookDelivery: s.lastWebhookDelivery,
           lastWebhookFailure: s.lastWebhookFailure,
+          lastHandlerError: s.lastHandlerError,
           zombieSuspected,
+          stalledPipeline,
         };
       }),
     };
@@ -198,7 +274,13 @@ class InstanceTracker {
       writeSnapshot(snap).catch(() => {});
       forensic({ kind: 'heartbeat', summary: snap }).catch(() => {});
       for (const inst of snap.instances) {
-        if (inst.zombieSuspected) {
+        if (inst.stalledPipeline) {
+          forensic({
+            kind: 'pipeline.stalled',
+            instance: inst.name,
+            ...inst,
+          }).catch(() => {});
+        } else if (inst.zombieSuspected) {
           forensic({
             kind: 'zombie.suspected',
             instance: inst.name,

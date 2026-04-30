@@ -4,6 +4,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { wa } from '@api/types/wa.types';
 import { configService, Log, Webhook } from '@config/env.config';
 import { Logger } from '@config/logger.config';
+import { endInFlight, startInFlight } from '@forensic/in-flight';
 import { instanceTracker } from '@forensic/instance-tracker';
 // import { BadRequestException } from '@exceptions';
 import axios, { AxiosInstance } from 'axios';
@@ -222,8 +223,17 @@ export class WebhookController extends EventController implements EventControlle
 
     while (attempts < maxRetryAttempts) {
       const t0 = Date.now();
+      const inflightId = startInFlight({
+        kind: 'webhook',
+        instance: webhookData?.instance ?? null,
+        url: baseURL,
+        event: webhookData?.event ?? 'unknown',
+        origin,
+        attempt: attempts + 1,
+      });
       try {
         const resp = await httpService.post('', webhookData);
+        endInFlight(inflightId);
         instanceTracker.recordWebhookDelivery(webhookData?.instance ?? null, {
           url: baseURL,
           event: webhookData?.event ?? 'unknown',
@@ -242,6 +252,7 @@ export class WebhookController extends EventController implements EventControlle
         }
         return;
       } catch (error) {
+        endInFlight(inflightId);
         attempts++;
 
         const isTimeout = error.code === 'ECONNABORTED';

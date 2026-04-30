@@ -1,4 +1,5 @@
 import { forensicSync, writeSnapshotSync } from '@forensic/forensic-logger';
+import { dumpInFlight } from '@forensic/in-flight';
 import { instanceTracker } from '@forensic/instance-tracker';
 
 import { Logger } from './logger.config';
@@ -6,8 +7,9 @@ import { Logger } from './logger.config';
 function captureFinalState(reason: string, extra?: Record<string, unknown>) {
   try {
     const snap = instanceTracker.snapshot();
+    const inflight = dumpInFlight();
     writeSnapshotSync(snap);
-    forensicSync({ kind: `process.${reason}`, ...(extra ?? {}), snapshot: snap });
+    forensicSync({ kind: `process.${reason}`, ...(extra ?? {}), inflight, snapshot: snap });
   } catch {
     /* noop */
   }
