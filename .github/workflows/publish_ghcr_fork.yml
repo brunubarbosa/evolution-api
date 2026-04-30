@@ -1,0 +1,62 @@
+name: Build & push fork image to GHCR
+
+on:
+  push:
+    branches:
+      - main
+      - feat/**
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Image tag (defaults to v2.3.7-sticker-forensic for main, branch slug otherwise)'
+        required: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Compute tag
+        id: tag
+        run: |
+          if [[ -n "${{ inputs.tag }}" ]]; then
+            echo "value=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            echo "value=v2.3.7-sticker-forensic" >> "$GITHUB_OUTPUT"
+          else
+            slug="${GITHUB_REF_NAME//\//-}"
+            echo "value=${slug}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: |
+            ghcr.io/brunubarbosa/evolution-api:${{ steps.tag.outputs.value }}
+            ghcr.io/brunubarbosa/evolution-api:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/brunubarbosa/evolution-api
+            org.opencontainers.image.revision=${{ github.sha }}
