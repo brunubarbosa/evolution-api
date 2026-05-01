@@ -8,8 +8,12 @@ function captureFinalState(reason: string, extra?: Record<string, unknown>) {
   try {
     const snap = instanceTracker.snapshot();
     const inflight = dumpInFlight();
+    // 2026-05-01 v3.1: include the in-memory ring of recent forensic events
+    // so the post-mortem is self-contained even if disk JSONL has rotated
+    // out (10MB × 3 keep ≈ 10min retention under verbose pino debug load).
+    const ringTail = instanceTracker.ringTail(100);
     writeSnapshotSync(snap);
-    forensicSync({ kind: `process.${reason}`, ...(extra ?? {}), inflight, snapshot: snap });
+    forensicSync({ kind: `process.${reason}`, ...(extra ?? {}), inflight, ringTail, snapshot: snap });
   } catch {
     /* noop */
   }

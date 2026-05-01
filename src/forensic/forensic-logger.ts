@@ -44,7 +44,32 @@ export type ForensicEvent = {
   [key: string]: unknown;
 };
 
+// 2026-05-01 v3.1: in-process observers. Allows the InstanceTracker to
+// receive copies of every forensic event (including ones written by code
+// outside the TS tree, like the Baileys mutex patch in node_modules) so its
+// snapshot counters stay in sync without polling JSONL on disk. Subscribers
+// MUST be synchronous and never throw — they run on the hot path.
+type ForensicObserver = (event: ForensicEvent) => void;
+const observers: ForensicObserver[] = [];
+export function subscribeForensic(fn: ForensicObserver): () => void {
+  observers.push(fn);
+  return () => {
+    const i = observers.indexOf(fn);
+    if (i >= 0) observers.splice(i, 1);
+  };
+}
+function notifyObservers(event: ForensicEvent): void {
+  for (const fn of observers) {
+    try {
+      fn(event);
+    } catch {
+      /* observers must never break the hot path */
+    }
+  }
+}
+
 export async function forensic(event: ForensicEvent): Promise<void> {
+  notifyObservers(event);
   ensureDir();
   maybeRotate();
   const line =
@@ -68,6 +93,7 @@ export async function forensic(event: ForensicEvent): Promise<void> {
 // Synchronous variant for shutdown handlers (uncaughtException, SIGTERM)
 // where the event loop will not drain pending appendFile promises.
 export function forensicSync(event: ForensicEvent): void {
+  notifyObservers(event);
   ensureDir();
   maybeRotate();
   const line =

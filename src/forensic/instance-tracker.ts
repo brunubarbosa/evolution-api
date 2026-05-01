@@ -1,4 +1,4 @@
-import { forensic, writeSnapshot } from './forensic-logger';
+import { forensic, forensicSync, subscribeForensic, writeSnapshot } from './forensic-logger';
 
 export type ActivityKind =
   | 'connection.update'
@@ -59,6 +59,35 @@ interface InstanceState {
   // tripping the heal action — we never want to react to a 1-tick blip.
   stalledSinceMs: number | null;
   lastAutoHealAt: number | null;
+  autoHealCount: number;
+  // 2026-05-01 v3.1: sliding-window error counters surfaced in every snapshot
+  // so we can spot "is this happening continuously?" without grepping JSONL.
+  // Per-instance for handler/auth-state errors; process-wide signals (mutex,
+  // prisma, fetch) are also broadcast to every instance so the snapshot
+  // reflects pool-wide pressure regardless of attribution.
+  mutexTimeouts: BucketCounter;
+  prismaTimeouts: BucketCounter;
+  fetchErrors: BucketCounter;
+  authStateTimeouts: BucketCounter;
+  // Last connection.update payload signature, to dedupe the steady-state
+  // pulse that fires {connection: null} dozens of times per second and
+  // floods the JSONL with empty event lines that hide real transitions.
+  lastConnectionUpdateSig: string | null;
+}
+
+interface BucketCounter {
+  // Append-only ring of timestamps within the last hour. Cheap O(n) prune
+  // on read (n is small — bound by error rate × window).
+  timestamps: number[];
+  // Last error message seen, for one-line debugging without JSONL grep.
+  lastError: { ts: number; message: string } | null;
+}
+
+interface RingEntry {
+  ts: number;
+  kind: string;
+  instance?: string | null;
+  detail?: unknown;
 }
 
 const BAILEYS_EVENT_KINDS = new Set<string>([
@@ -80,7 +109,19 @@ const BAILEYS_EVENT_KINDS = new Set<string>([
 ]);
 
 const HEARTBEAT_MS = Number(process.env.FORENSIC_HEARTBEAT_MS) || 60_000;
-const ZOMBIE_GAP_MS = Number(process.env.FORENSIC_ZOMBIE_GAP_MS) || 10 * 60_000;
+// Lowered 2026-05-01 from 600_000 (10min) → 180_000 (3min). The investigation
+// caught a 9m59s stall the old threshold missed by 1s; 3min validated against
+// 4 days of forensic JSONL with zero false positives on legitimate quiet
+// groups. Aligned with AUTO_HEAL_AFTER_MS so the heal trips on the second
+// heartbeat after detection.
+const ZOMBIE_GAP_MS = Number(process.env.FORENSIC_ZOMBIE_GAP_MS) || 3 * 60_000;
+// Sliding-window sizes for error-rate counters surfaced in every snapshot.
+const ERROR_WINDOW_5M = 5 * 60_000;
+const ERROR_WINDOW_1H = 60 * 60_000;
+// In-memory ring of recent forensic events. Survives even if disk JSONL has
+// rotated out — included in the uncaughtException dump for self-contained
+// post-mortems. 200 entries ≈ 3min of a chatty bot's significant events.
+const RING_SIZE = Number(process.env.FORENSIC_RING_SIZE) || 200;
 
 // Auto-heal: when `stalledPipeline` has been true continuously for this
 // long, call `forceClose` to make Baileys reconnect with a fresh socket
@@ -91,10 +132,46 @@ const AUTO_HEAL_ENABLED = String(process.env.FORENSIC_AUTO_HEAL || '').toLowerCa
 const AUTO_HEAL_AFTER_MS = Number(process.env.FORENSIC_AUTO_HEAL_AFTER_MS) || 3 * 60_000;
 const AUTO_HEAL_COOLDOWN_MS = Number(process.env.FORENSIC_AUTO_HEAL_COOLDOWN_MS) || 5 * 60_000;
 
+function emptyBucket(): BucketCounter {
+  return { timestamps: [], lastError: null };
+}
+
+function bumpBucket(b: BucketCounter, message?: string): void {
+  const now = Date.now();
+  b.timestamps.push(now);
+  // Prune anything older than 1h to keep memory bounded under a sustained
+  // error storm (worst case: ~3600 entries/h at 1Hz; harmless).
+  const cutoff = now - ERROR_WINDOW_1H;
+  let i = 0;
+  while (i < b.timestamps.length && b.timestamps[i] < cutoff) i++;
+  if (i > 0) b.timestamps.splice(0, i);
+  if (message) b.lastError = { ts: now, message: message.slice(0, 300) };
+}
+
+function bucketSummary(b: BucketCounter) {
+  const now = Date.now();
+  let c5 = 0;
+  for (const t of b.timestamps) if (now - t <= ERROR_WINDOW_5M) c5++;
+  return { last5m: c5, last1h: b.timestamps.length, lastError: b.lastError };
+}
+
 class InstanceTracker {
   private map = new Map<string, InstanceState>();
   private timer: NodeJS.Timeout | null = null;
   private lastEventLoopLagMs = 0;
+  // In-memory event ring — see RING_SIZE comment above.
+  private ring: RingEntry[] = [];
+
+  private pushRing(entry: Omit<RingEntry, 'ts'>): void {
+    this.ring.push({ ts: Date.now(), ...entry });
+    if (this.ring.length > RING_SIZE) {
+      this.ring.splice(0, this.ring.length - RING_SIZE);
+    }
+  }
+
+  ringTail(n = 50): RingEntry[] {
+    return this.ring.slice(-n);
+  }
 
   register(
     name: string,
@@ -137,8 +214,15 @@ class InstanceTracker {
       forceClose,
       stalledSinceMs: null,
       lastAutoHealAt: null,
+      autoHealCount: 0,
+      mutexTimeouts: emptyBucket(),
+      prismaTimeouts: emptyBucket(),
+      fetchErrors: emptyBucket(),
+      authStateTimeouts: emptyBucket(),
+      lastConnectionUpdateSig: null,
     });
     forensic({ kind: 'instance.register', instance: name, channel }).catch(() => {});
+    this.pushRing({ kind: 'instance.register', instance: name });
   }
 
   unregister(name: string) {
@@ -179,8 +263,58 @@ class InstanceTracker {
     // Always log close/error/connection.update to forensic file as full lines.
     // Routine activity is summarized in heartbeat to keep file size sane.
     if (kind === 'connection.update' || kind === 'ws.close' || kind === 'ws.error' || kind === 'ws.open') {
-      forensic({ kind: `event.${kind}`, instance: name, ...(detail ?? {}) }).catch(() => {});
+      // Dedupe connection.update floods: the steady-state pulse fires it
+      // dozens of times per second with {connection: null} only — useless
+      // line noise that hid the meaningful transitions in the 2026-05-01
+      // forensic trail. Compare the meaningful subset and skip duplicates.
+      let shouldLog = true;
+      if (kind === 'connection.update' && detail) {
+        const sig = JSON.stringify({
+          connection: (detail as any).connection ?? null,
+          statusCode: (detail as any).statusCode ?? null,
+          errorMessage: (detail as any).errorMessage ?? null,
+          hasQr: (detail as any).hasQr ?? false,
+        });
+        if (
+          s.lastConnectionUpdateSig === sig &&
+          sig === '{"connection":null,"statusCode":null,"errorMessage":null,"hasQr":false}'
+        ) {
+          shouldLog = false;
+        }
+        s.lastConnectionUpdateSig = sig;
+      }
+      if (shouldLog) {
+        forensic({ kind: `event.${kind}`, instance: name, ...(detail ?? {}) }).catch(() => {});
+        this.pushRing({ kind: `event.${kind}`, instance: name, detail });
+      }
     }
+  }
+
+  // 2026-05-01 v3.1: external signal hooks. The Baileys make-mutex patch and
+  // global-fetch-instrument fire these so the snapshot can show error rates
+  // without depending on JSONL parsing.
+  recordMutexTimeout(instance: string | null | undefined, message?: string) {
+    if (instance) {
+      const s = this.map.get(instance);
+      if (s) bumpBucket(s.mutexTimeouts, message);
+    } else {
+      // Mutex timeouts from inside Baileys can't reliably attribute to an
+      // instance — broadcast to all so process-wide pressure is visible.
+      for (const s of this.map.values()) bumpBucket(s.mutexTimeouts, message);
+    }
+    this.pushRing({ kind: 'baileys.mutex.timeout', instance: instance ?? null });
+  }
+
+  recordPrismaTimeout(message: string, model?: string, op?: string) {
+    // Prisma timeouts are pool-wide pressure: bump every instance bucket.
+    for (const s of this.map.values()) bumpBucket(s.prismaTimeouts, `${model ?? '?'}.${op ?? '?'}: ${message}`);
+    this.pushRing({ kind: 'prisma.timeout', detail: { model, op, message: message.slice(0, 200) } });
+  }
+
+  recordFetchError(host: string, message?: string) {
+    // Fetch errors aren't naturally per-instance either; broadcast.
+    for (const s of this.map.values()) bumpBucket(s.fetchErrors, `${host}: ${message ?? ''}`);
+    this.pushRing({ kind: 'fetch.error', detail: { host, message } });
   }
 
   recordWebhookDelivery(
@@ -228,9 +362,16 @@ class InstanceTracker {
         s.lastHandlerErrorAt = now;
         s.lastHandlerError = detail;
         s.handlerErrorCount += 1;
+        // Attribute auth-state timeouts to the per-instance bucket so the
+        // snapshot can show "this instance is dragging on Prisma" vs
+        // "process-wide Prisma is sick" at a glance.
+        if (detail.handler.startsWith('authState.') || detail.handler === 'AuthStateTimeoutError') {
+          bumpBucket(s.authStateTimeouts, detail.error?.message);
+        }
       }
     }
     forensic({ kind: 'baileys.handler.error', instance: name ?? null, ...detail }).catch(() => {});
+    this.pushRing({ kind: 'baileys.handler.error', instance: name ?? null, detail });
   }
 
   snapshot() {
@@ -289,11 +430,45 @@ class InstanceTracker {
           lastWebhookDelivery: s.lastWebhookDelivery,
           lastWebhookFailure: s.lastWebhookFailure,
           lastHandlerError: s.lastHandlerError,
+          // 2026-05-01 v3.1: per-snapshot rate counters — visible in every
+          // /forensic/snapshot response, no JSONL parsing required to answer
+          // "is something silently failing every 30s?"
+          mutexTimeouts: bucketSummary(s.mutexTimeouts),
+          prismaTimeouts: bucketSummary(s.prismaTimeouts),
+          fetchErrors: bucketSummary(s.fetchErrors),
+          authStateTimeouts: bucketSummary(s.authStateTimeouts),
+          autoHealCount: s.autoHealCount,
+          msSinceLastAutoHeal: s.lastAutoHealAt ? now - s.lastAutoHealAt : null,
+          msSinceStalledStart: s.stalledSinceMs ? now - s.stalledSinceMs : null,
           zombieSuspected,
           stalledPipeline,
         };
       }),
+      thresholds: {
+        zombieGapMs: ZOMBIE_GAP_MS,
+        autoHealEnabled: AUTO_HEAL_ENABLED,
+        autoHealAfterMs: AUTO_HEAL_AFTER_MS,
+        autoHealCooldownMs: AUTO_HEAL_COOLDOWN_MS,
+        heartbeatMs: HEARTBEAT_MS,
+      },
+      ringSize: this.ring.length,
     };
+  }
+
+  // For error.config.ts: synchronously dump snapshot + ring tail into the
+  // forensic JSONL when the process is about to die. Self-contained so a
+  // post-mortem doesn't require disk JSONL retention.
+  emergencyFlushSync(reason: string, extra?: Record<string, unknown>) {
+    try {
+      forensicSync({
+        kind: `emergency.${reason}`,
+        ...(extra ?? {}),
+        snapshot: this.snapshot(),
+        ringTail: this.ringTail(50),
+      });
+    } catch {
+      /* noop */
+    }
   }
 
   startHeartbeat() {
@@ -336,10 +511,12 @@ class InstanceTracker {
         ) {
           const stalledForMs = now - state.stalledSinceMs;
           state.lastAutoHealAt = now;
+          state.autoHealCount += 1;
           forensic({
             kind: 'autoheal.fire',
             instance: inst.name,
             stalledForMs,
+            autoHealCount: state.autoHealCount,
             reason: inst.stalledPipeline ? 'stalled-pipeline' : 'zombie-suspected',
           }).catch(() => {});
           try {
@@ -375,3 +552,53 @@ class InstanceTracker {
 }
 
 export const instanceTracker = new InstanceTracker();
+
+// 2026-05-01 v3.1: route every forensic() event through the tracker so the
+// snapshot counters stay current without a polling loop. We listen for the
+// kinds we know about; everything else is ignored. Observers are synchronous
+// and swallowed if they throw, so this is safe on the hot path.
+subscribeForensic((event) => {
+  switch (event.kind) {
+    case 'prisma.timeout':
+      instanceTracker.recordPrismaTimeout(
+        String((event as any).message ?? ''),
+        (event as any).model as string | undefined,
+        (event as any).op as string | undefined,
+      );
+      break;
+    case 'fetch.error':
+    case 'fetch.slow':
+      instanceTracker.recordFetchError(
+        String((event as any).host ?? (event as any).url ?? '?'),
+        String((event as any).message ?? (event as any).error?.message ?? ''),
+      );
+      break;
+    case 'baileys.mutex.timeout':
+      // Emitted both by the in-tree handler-error path and (synchronously,
+      // outside this process tree) by the make-mutex.js patch via raw
+      // fs.appendFileSync — the latter does NOT pass through forensic() so
+      // it doesn't reach this observer. We still bump from the in-tree
+      // path; the JSONL line written by the patch is the authoritative
+      // source for cumulative counts.
+      instanceTracker.recordMutexTimeout(
+        ((event as any).instance ?? null) as string | null,
+        String((event as any).message ?? ''),
+      );
+      break;
+    case 'authstate.io.timeout': {
+      // The auth-state v3 patch writes this on every Prisma/Redis/fs
+      // timeout inside useMultiFileAuthStatePrisma. Carries `sessionId`
+      // (which IS the instance name) and `op` ("prisma.session.findUnique"
+      // etc.). Route to the per-instance authStateTimeouts bucket via
+      // recordHandlerError so the existing handlerErrorCount also bumps.
+      const inst = ((event as any).sessionId ?? (event as any).instance ?? null) as string | null;
+      if (inst) {
+        instanceTracker.recordHandlerError(inst, {
+          handler: 'authState.' + ((event as any).op ?? 'io'),
+          error: { message: `auth-state I/O timeout on ${(event as any).key ?? '?'}` },
+        });
+      }
+      break;
+    }
+  }
+});

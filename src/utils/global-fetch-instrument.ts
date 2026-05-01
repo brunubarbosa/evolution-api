@@ -64,9 +64,45 @@ export function installGlobalFetchInstrument() {
         // Lazy-import forensic to avoid a circular load (in-flight is
         // imported above, fine; forensic-logger has no inflight dep).
         const { forensic } = await import('@forensic/forensic-logger');
-        forensic({ kind: 'fetch.slow', url, method, durationMs: elapsed }).catch(() => {});
+        let host = '?';
+        try {
+          host = new URL(url).host;
+        } catch {
+          /* noop */
+        }
+        forensic({ kind: 'fetch.slow', url, host, method, durationMs: elapsed }).catch(() => {});
       }
       return result;
+    } catch (err) {
+      // 2026-05-01 v3.1: capture undici/network errors so the snapshot
+      // counter (and observers in instance-tracker) see them, not just
+      // slow-but-successful calls. The 04-30 incident's stack pointed at
+      // undici Fetch.onAborted with no URL — this fixes that.
+      try {
+        const e = err as Error & { code?: string; cause?: { message?: string; code?: string } };
+        let host = '?';
+        try {
+          host = new URL(url).host;
+        } catch {
+          /* noop */
+        }
+        const { forensic } = await import('@forensic/forensic-logger');
+        forensic({
+          kind: 'fetch.error',
+          url,
+          host,
+          method,
+          durationMs: Date.now() - start,
+          message: e?.message,
+          name: e?.name,
+          code: e?.code,
+          causeMessage: e?.cause?.message,
+          causeCode: e?.cause?.code,
+        }).catch(() => {});
+      } catch {
+        /* never break the request path over forensic IO */
+      }
+      throw err;
     } finally {
       endInFlight(id);
     }
