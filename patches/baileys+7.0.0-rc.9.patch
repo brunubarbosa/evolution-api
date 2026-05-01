@@ -1,0 +1,53 @@
+diff --git a/node_modules/baileys/lib/Utils/make-mutex.js b/node_modules/baileys/lib/Utils/make-mutex.js
+index 768f14f..7342fab 100644
+--- a/node_modules/baileys/lib/Utils/make-mutex.js
++++ b/node_modules/baileys/lib/Utils/make-mutex.js
+@@ -1,27 +1,39 @@
++// figurinha-fork patch: Promise.race timeout on every mutex acquisition.
++// Upstream rc.9 has no timeout — a stuck await locks the queue forever.
++// See PR #2151 (replaces with async-mutex; merged on master, unreleased).
++// We keep the original API; on timeout, the held slot rejects so the next
++// queued caller proceeds. The runaway code() promise is intentionally leaked
++// (still running, but no longer blocking the queue).
++const DEFAULT_MUTEX_TIMEOUT_MS = Number(process.env.BAILEYS_MUTEX_TIMEOUT_MS) || 60000;
++class MutexTimeoutError extends Error {
++    constructor(ms) {
++        super(`mutex code() did not resolve within ${ms}ms`);
++        this.name = 'MutexTimeoutError';
++    }
++}
+ export const makeMutex = () => {
+-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+     let task = Promise.resolve();
+-    let taskTimeout;
+     return {
+         mutex(code) {
+             task = (async () => {
+-                // wait for the previous task to complete
+-                // if there is an error, we swallow so as to not block the queue
+                 try {
+                     await task;
+                 }
+                 catch { }
++                let timer;
++                const timeoutPromise = new Promise((_, reject) => {
++                    timer = setTimeout(() => reject(new MutexTimeoutError(DEFAULT_MUTEX_TIMEOUT_MS)), DEFAULT_MUTEX_TIMEOUT_MS);
++                });
+                 try {
+-                    // execute the current task
+-                    const result = await code();
++                    const result = await Promise.race([code(), timeoutPromise]);
+                     return result;
+                 }
+                 finally {
+-                    clearTimeout(taskTimeout);
++                    if (timer) {
++                        clearTimeout(timer);
++                    }
+                 }
+             })();
+-            // we replace the existing task, appending the new piece of execution to it
+-            // so the next task will have to wait for this one to finish
+             return task;
+         }
+     };

@@ -12,6 +12,10 @@ WORKDIR /evolution
 COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
+# patches/ must exist before npm ci so the postinstall hook (patch-package)
+# can apply our Baileys mutex-timeout patch on top of the freshly installed
+# node_modules. Without this, the build succeeds but ships unpatched Baileys.
+COPY ./patches ./patches
 
 RUN npm ci --silent
 
