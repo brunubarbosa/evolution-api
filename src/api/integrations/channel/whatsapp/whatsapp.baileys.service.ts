@@ -720,13 +720,30 @@ export class BaileysStartupService extends ChannelStartupService {
     // ── Forensic: register instance + raw WS lifecycle hooks ──
     try {
       const wsRef: any = this.client?.ws;
-      instanceTracker.register(this.instance.name, 'baileys', () => {
-        try {
-          return typeof wsRef?.readyState === 'number' ? wsRef.readyState : null;
-        } catch {
-          return null;
-        }
-      });
+      instanceTracker.register(
+        this.instance.name,
+        'baileys',
+        () => {
+          try {
+            return typeof wsRef?.readyState === 'number' ? wsRef.readyState : null;
+          } catch {
+            return null;
+          }
+        },
+        // Auto-heal hook: when the heartbeat decides the pipeline is
+        // stalled past the threshold, it calls this to force a fresh
+        // socket. We use `this.client.end(...)` rather than `ws.close()`
+        // because the former triggers Baileys' own reconnect path and
+        // tears down the processingMutex chain along with the socket.
+        (reason: string) => {
+          try {
+            this.logger.warn(`[autoheal] forcing reconnect: ${reason}`);
+            this.client?.end?.(new Error(`autoheal:${reason}`));
+          } catch (err: any) {
+            this.logger.error(`[autoheal] forceClose failed: ${err?.message}`);
+          }
+        },
+      );
       if (wsRef?.on) {
         wsRef.on('open', () => {
           instanceTracker.recordActivity(this.instance.name, 'ws.open');

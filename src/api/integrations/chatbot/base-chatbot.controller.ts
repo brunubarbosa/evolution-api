@@ -9,7 +9,12 @@ import { TriggerOperator, TriggerType } from '@prisma/client';
 import { getConversationMessage } from '@utils/getConversationMessage';
 
 import { BaseChatbotDto } from './base-chatbot.dto';
-import { ChatbotController, ChatbotControllerInterface, EmitData } from './chatbot.controller';
+import {
+  ChatbotController,
+  ChatbotControllerInterface,
+  EmitData,
+  invalidateChatbotEnabledCache,
+} from './chatbot.controller';
 
 // Common settings interface for all chatbot integrations
 export interface ChatbotSettings {
@@ -233,6 +238,7 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
         data: botData,
       });
 
+      invalidateChatbotEnabledCache(instanceId);
       return bot;
     } catch (error) {
       this.logger.error(error);
@@ -725,6 +731,7 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
         data: updateData,
       });
 
+      invalidateChatbotEnabledCache(instanceId);
       return updatedBot;
     } catch (error) {
       this.logger.error(error);
@@ -777,6 +784,7 @@ export abstract class BaseChatbotController<BotType = any, BotData extends BaseC
         },
       });
 
+      invalidateChatbotEnabledCache(instanceId);
       return { bot: { id: botId } };
     } catch (error) {
       this.logger.error(error);

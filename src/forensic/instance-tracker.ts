@@ -50,6 +50,15 @@ interface InstanceState {
   dbStatus: string | null;
   // populated by getter functions registered from the service
   wsReadyState?: () => number | null;
+  // 2026-05-01: optional close hook so the heartbeat can force a reconnect
+  // when a stall persists past the auto-heal threshold. Registered by the
+  // baileys service alongside `wsReadyState`.
+  forceClose?: (reason: string) => void;
+  // tracks when stalledPipeline first became true in the current run, so
+  // we can wait until it's been stuck for `AUTO_HEAL_AFTER_MS` before
+  // tripping the heal action — we never want to react to a 1-tick blip.
+  stalledSinceMs: number | null;
+  lastAutoHealAt: number | null;
 }
 
 const BAILEYS_EVENT_KINDS = new Set<string>([
@@ -73,16 +82,31 @@ const BAILEYS_EVENT_KINDS = new Set<string>([
 const HEARTBEAT_MS = Number(process.env.FORENSIC_HEARTBEAT_MS) || 60_000;
 const ZOMBIE_GAP_MS = Number(process.env.FORENSIC_ZOMBIE_GAP_MS) || 10 * 60_000;
 
+// Auto-heal: when `stalledPipeline` has been true continuously for this
+// long, call `forceClose` to make Baileys reconnect with a fresh socket
+// (and a fresh `processingMutex`). Disabled by default; enable by setting
+// FORENSIC_AUTO_HEAL=true. After firing, we cool down for at least the
+// same window before firing again on the same instance.
+const AUTO_HEAL_ENABLED = String(process.env.FORENSIC_AUTO_HEAL || '').toLowerCase() === 'true';
+const AUTO_HEAL_AFTER_MS = Number(process.env.FORENSIC_AUTO_HEAL_AFTER_MS) || 3 * 60_000;
+const AUTO_HEAL_COOLDOWN_MS = Number(process.env.FORENSIC_AUTO_HEAL_COOLDOWN_MS) || 5 * 60_000;
+
 class InstanceTracker {
   private map = new Map<string, InstanceState>();
   private timer: NodeJS.Timeout | null = null;
   private lastEventLoopLagMs = 0;
 
-  register(name: string, channel: 'baileys' | 'cloud', wsReadyState?: () => number | null) {
+  register(
+    name: string,
+    channel: 'baileys' | 'cloud',
+    wsReadyState?: () => number | null,
+    forceClose?: (reason: string) => void,
+  ) {
     const existing = this.map.get(name);
     if (existing) {
       existing.channel = channel;
       if (wsReadyState) existing.wsReadyState = wsReadyState;
+      if (forceClose) existing.forceClose = forceClose;
       return;
     }
     this.map.set(name, {
@@ -110,6 +134,9 @@ class InstanceTracker {
       handlerErrorCount: 0,
       dbStatus: null,
       wsReadyState,
+      forceClose,
+      stalledSinceMs: null,
+      lastAutoHealAt: null,
     });
     forensic({ kind: 'instance.register', instance: name, channel }).catch(() => {});
   }
@@ -133,6 +160,9 @@ class InstanceTracker {
     } else if (BAILEYS_EVENT_KINDS.has(kind)) {
       s.lastBaileysEventAt = now;
       s.lastBaileysEventKind = kind;
+      // pipeline recovered — reset the stall clock so the next zombie
+      // gets a clean window before auto-heal trips.
+      if (s.stalledSinceMs !== null) s.stalledSinceMs = null;
     }
 
     if (kind === 'connection.update') {
@@ -273,6 +303,7 @@ class InstanceTracker {
       const snap = this.snapshot();
       writeSnapshot(snap).catch(() => {});
       forensic({ kind: 'heartbeat', summary: snap }).catch(() => {});
+      const now = Date.now();
       for (const inst of snap.instances) {
         if (inst.stalledPipeline) {
           forensic({
@@ -286,6 +317,40 @@ class InstanceTracker {
             instance: inst.name,
             ...inst,
           }).catch(() => {});
+        }
+
+        // Track the start of a continuous stall + maybe auto-heal.
+        const state = this.map.get(inst.name);
+        if (!state) continue;
+        const isStalled = inst.stalledPipeline || inst.zombieSuspected;
+        if (isStalled && state.stalledSinceMs === null) {
+          state.stalledSinceMs = now;
+        }
+        if (
+          AUTO_HEAL_ENABLED &&
+          isStalled &&
+          state.stalledSinceMs !== null &&
+          now - state.stalledSinceMs >= AUTO_HEAL_AFTER_MS &&
+          (state.lastAutoHealAt === null || now - state.lastAutoHealAt >= AUTO_HEAL_COOLDOWN_MS) &&
+          typeof state.forceClose === 'function'
+        ) {
+          const stalledForMs = now - state.stalledSinceMs;
+          state.lastAutoHealAt = now;
+          forensic({
+            kind: 'autoheal.fire',
+            instance: inst.name,
+            stalledForMs,
+            reason: inst.stalledPipeline ? 'stalled-pipeline' : 'zombie-suspected',
+          }).catch(() => {});
+          try {
+            state.forceClose(`autoheal:${inst.stalledPipeline ? 'stalled' : 'zombie'}:${stalledForMs}ms`);
+          } catch (err: any) {
+            forensic({
+              kind: 'autoheal.error',
+              instance: inst.name,
+              error: { message: err?.message, stack: err?.stack?.split('\n').slice(0, 4).join('\n') },
+            }).catch(() => {});
+          }
         }
       }
     }, HEARTBEAT_MS);

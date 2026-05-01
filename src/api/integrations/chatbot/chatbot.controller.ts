@@ -11,8 +11,30 @@ import {
 } from '@api/server.module';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { Logger } from '@config/logger.config';
+import { forensic } from '@forensic/forensic-logger';
 import { IntegrationSession } from '@prisma/client';
 import { findBotByTrigger } from '@utils/findBotByTrigger';
+
+// 2026-05-01 incident: every messages.upsert fans out to 7 chatbot
+// controllers, each issuing 1-3 Prisma findFirst/findMany against its own
+// config table (Typebot, Flowise, Dify, EvolutionBot, OpenAI, n8n, Evoai)
+// plus FlowiseSetting, DifySetting, etc. With 0 chatbots configured this
+// is pure overhead — 9+ queries per message. When 9 of those parked in
+// `idle/ClientRead` after an undici `terminated` exception, the entire
+// connection pool wedged for 3.6 hours.
+//
+// Mitigation: cache "any chatbot enabled for this instance?" per
+// instanceId and skip the fan-out entirely if cached `false`. Cache TTL
+// is short (60s) so a freshly-enabled bot picks up within the next minute.
+// On any chatbot create/update the cache for that instance is invalidated
+// (see invalidateChatbotEnabledCache below).
+const CHATBOT_ENABLED_CACHE_TTL_MS = Number(process.env.CHATBOT_ENABLED_CACHE_TTL_MS) || 60_000;
+const chatbotEnabledCache = new Map<string, { enabled: boolean; expiresAt: number }>();
+
+export function invalidateChatbotEnabledCache(instanceId?: string) {
+  if (instanceId) chatbotEnabledCache.delete(instanceId);
+  else chatbotEnabledCache.clear();
+}
 
 export type EmitData = {
   instance: InstanceDto;
@@ -71,6 +93,45 @@ export class ChatbotController {
     return this.waMonitor;
   }
 
+  private async anyChatbotEnabled(instanceId: string): Promise<boolean> {
+    const now = Date.now();
+    const cached = chatbotEnabledCache.get(instanceId);
+    if (cached && cached.expiresAt > now) return cached.enabled;
+
+    // One small parallel COUNT batch instead of 7+ sequential findFirst calls.
+    // Each count uses the existing (instanceId, enabled) covering indexes.
+    let enabled = false;
+    try {
+      const counts = await Promise.all([
+        this.prismaRepository.typebot.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.openaiBot.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.evolutionBot.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.dify.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.flowise.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.n8n.count({ where: { instanceId, enabled: true } }),
+        this.prismaRepository.evoai.count({ where: { instanceId, enabled: true } }),
+      ]);
+      enabled = counts.some((c) => c > 0);
+    } catch (err) {
+      // If any count throws (incl. PrismaTimeoutError), be conservative:
+      // assume something is configured and let the per-controller emit
+      // path attempt — they each have their own try/catch. We still
+      // record the fact so we can correlate with prisma.timeout events.
+      forensic({
+        kind: 'chatbot.precheck.error',
+        instance: instanceId,
+        error: err instanceof Error ? { name: err.name, message: err.message } : String(err),
+      }).catch(() => {});
+      enabled = true;
+    }
+
+    chatbotEnabledCache.set(instanceId, {
+      enabled,
+      expiresAt: now + CHATBOT_ENABLED_CACHE_TTL_MS,
+    });
+    return enabled;
+  }
+
   public async emit({
     instance,
     remoteJid,
@@ -84,6 +145,13 @@ export class ChatbotController {
     pushName?: string;
     isIntegration?: boolean;
   }): Promise<void> {
+    // Short-circuit: if no chatbot is configured for this instance, skip
+    // the entire fan-out. Saves 7+ Prisma queries per inbound message.
+    if (instance?.instanceId) {
+      const enabled = await this.anyChatbotEnabled(instance.instanceId);
+      if (!enabled) return;
+    }
+
     const emitData = {
       instance,
       remoteJid,

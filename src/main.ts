@@ -1,7 +1,11 @@
-// Import this first from sentry instrument!
+// IMPORTANT: load order matters. The two side-effect imports below MUST
+// run before any module that captures references to globalThis.fetch
+// (Baileys/undici, axios adapters) or that registers Sentry handlers.
+// eslint-disable-next-line simple-import-sort/imports
+import '@utils/global-fetch-instrument';
+// eslint-disable-next-line simple-import-sort/imports
 import '@utils/instrumentSentry';
 
-// Now import other modules
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';

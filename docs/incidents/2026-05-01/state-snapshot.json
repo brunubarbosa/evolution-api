@@ -1,0 +1,89 @@
+{
+  "ts": "2026-05-01T15:00:54.532Z",
+  "pid": 197,
+  "payload": {
+    "ts": "2026-05-01T15:00:54.531Z",
+    "pid": 197,
+    "uptimeSec": 47796,
+    "eventLoopLagMs": 0,
+    "memory": {
+      "rssMb": 177,
+      "heapUsedMb": 78,
+      "heapTotalMb": 83,
+      "externalMb": 10
+    },
+    "instances": [
+      {
+        "name": "figurinha-bot-02",
+        "channel": "baileys",
+        "dbStatus": "open",
+        "wsReadyState": null,
+        "uptimeSec": 47792,
+        "lastActivityKind": "ws.message",
+        "lastBaileysEventKind": "contacts.update",
+        "msSinceLastActivity": 232,
+        "msSinceLastBaileysEvent": 13303656,
+        "msSinceLastWsMessage": 232,
+        "msSinceLastConnectionUpdate": 17843696,
+        "msSinceLastWsClose": null,
+        "msSinceLastWebhookDelivery": 13303749,
+        "msSinceLastWebhookFailure": 17987983,
+        "msSinceLastHandlerError": null,
+        "handlerErrorCount": 0,
+        "activityCounts": {
+          "connection.update": 18,
+          "ws.open": 2,
+          "ws.message": 42832,
+          "creds.update": 155,
+          "chats.update": 6138,
+          "messages.upsert": 9752,
+          "contacts.update": 8978,
+          "group-participants.update": 261,
+          "group.join-request": 72,
+          "messages.reaction": 227,
+          "messages.update": 52,
+          "message-receipt.update": 126,
+          "presence.update": 1509,
+          "groups.update": 19,
+          "call": 1
+        },
+        "lastConnectionUpdate": {
+          "connection": null,
+          "hasQr": false,
+          "statusCode": null,
+          "errorMessage": null,
+          "errorName": null,
+          "boomData": null
+        },
+        "lastWsClose": null,
+        "lastWsError": null,
+        "lastWebhookDelivery": {
+          "url": "https://figurinhawhatsapp.com/api/webhooks/evolution",
+          "event": "messages.upsert",
+          "origin": "p.sendData-Webhook",
+          "ok": true,
+          "httpStatus": 200,
+          "latencyMs": 454,
+          "attempt": 1
+        },
+        "lastWebhookFailure": {
+          "url": "https://figurinhawhatsapp.com/api/webhooks/evolution",
+          "event": "messages.upsert",
+          "origin": "p.sendData-Webhook",
+          "ok": false,
+          "httpStatus": 502,
+          "latencyMs": 10108,
+          "attempt": 1,
+          "error": {
+            "code": "ERR_BAD_RESPONSE",
+            "message": "Request failed with status code 502",
+            "isTimeout": false
+          }
+        },
+        "lastHandlerError": null,
+        "zombieSuspected": true,
+        "stalledPipeline": true
+      }
+    ]
+  }
+}

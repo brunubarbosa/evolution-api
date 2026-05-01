@@ -1,13 +1,22 @@
 # Zombie Instance Investigation — figurinha-bot-02
 
-**Last updated:** 2026-04-30
-**Status:** Patch deployed (forensic v2 + Baileys mutex timeout). Long-term fix pending Baileys v7.0.0 stable.
+**Last updated:** 2026-05-01
+**Status:** Patch v4 deployed (Prisma per-call timeout + chatbot fan-out short-circuit + auto-heal + global fetch tracking). Episode 4 root cause was outside Baileys entirely — chatbot integration query fan-out wedging the Prisma pool after an undici exception. See `docs/incidents/2026-05-01/README.md`.
 
 This document is the source of truth for the silent-freeze investigation that consumed 2026-04-30. It captures: what we observed, what we tried, what was wrong about each fix, and what the actual root cause is. Read this before touching `src/forensic/*`, `patches/*`, or the eventHandler in `whatsapp.baileys.service.ts` — the wrong reflex is to "simplify" things that look weird but are load-bearing.
 
 ## TL;DR
 
-The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We chased it through **four** theories before landing on the real two:
+The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We've now identified **four** distinct zombie classes:
+
+1. uncaughtException class (patched G4)
+2. Baileys mutex deadlock class (patched v1+v2)
+3. Auth-state Prisma pool exhaustion class (patched v3)
+4. **Chatbot integration fan-out + Prisma pool exhaustion class (patched v4 — 2026-05-01)** ← see `docs/incidents/2026-05-01/`
+
+Original 2026-04-30 narrative below — the post-2026-04-30 history is in the incident folder, kept separate so the investigation flow stays readable.
+
+We chased it through **four** theories before landing on the real two:
 
 1. ❌ **First theory:** an undici `terminated` exception killed our event handlers. Patched G4 (handler hardening) — bot stalled again 50 min later, no exception in sight.
 2. ❌ **Second theory:** our forensic detector was off by 1 second (10 min threshold, real stalls happen at 9m59s). Lowering threshold would have detected — but not fixed — the bug.
