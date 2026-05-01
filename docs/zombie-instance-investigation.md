@@ -1,18 +1,107 @@
 # Zombie Instance Investigation — figurinha-bot-02
 
-**Last updated:** 2026-05-01
-**Status:** Patch v4 deployed (Prisma per-call timeout + chatbot fan-out short-circuit + auto-heal + global fetch tracking). Episode 4 root cause was outside Baileys entirely — chatbot integration query fan-out wedging the Prisma pool after an undici exception. See `docs/incidents/2026-05-01/README.md`.
+**Last updated:** 2026-05-01 22:50 UTC
+**Status:** Patch v5 deployed (snapshot blind-spots closed) + Postgres `idle_session_timeout` disabled. Episode 5 was the same `TypeError: terminated` from undici as ep1 + ep4, but the root-cause amplifier was Postgres-side: `idle_session_timeout=60000` was killing pool sockets every 60s, which is what made every prior class of zombie reproducible. See `docs/incidents/2026-05-01-ep5/README.md`.
 
-This document is the source of truth for the silent-freeze investigation that consumed 2026-04-30. It captures: what we observed, what we tried, what was wrong about each fix, and what the actual root cause is. Read this before touching `src/forensic/*`, `patches/*`, or the eventHandler in `whatsapp.baileys.service.ts` — the wrong reflex is to "simplify" things that look weird but are load-bearing.
+> **READ THIS FIRST IF YOU'RE CONTINUING AFTER A SESSION GAP.**
+> See [`## Where we are now (post-ep5)`](#where-we-are-now-post-ep5) below — it is the only section that matters when you're picking up cold. The rest is historical.
+
+This document is the source of truth for the silent-freeze investigation that consumed 2026-04-30 → 2026-05-01. It captures: what we observed, what we tried, what was wrong about each fix, and what the actual root cause is. Read this before touching `src/forensic/*`, `patches/*`, or the eventHandler in `whatsapp.baileys.service.ts` — the wrong reflex is to "simplify" things that look weird but are load-bearing.
+
+## Where we are now (post-ep5)
+
+**2026-05-01 22:50 UTC** — figurinha-bot-02 fully recovered; 124 webhooks/5min flowing.
+
+### What's deployed
+
+Production image: `ghcr.io/brunubarbosa/evolution-api:v2.3.7-sticker-forensic` at commit **`7cb09d4`** (branch `main`). Rollback target: `:v2.3.7-sticker-forensic-prev` (image SHA `517b6c1846bc`).
+
+### What changed in this fix wave (chronological)
+
+| Commit | What | File touched |
+|---|---|---|
+| `2601764` | Baileys mutex 60s `Promise.race` timeout | `patches/baileys+7.0.0-rc.9.patch` |
+| `d0e57cc` | Mutex patch v2 — emit `baileys.mutex.timeout` to forensic.jsonl | same patch file |
+| `82e9d00` | Auth-state I/O 15s timeout (Prisma + Redis + fs) | `src/utils/use-multi-file-auth-state-prisma.ts` |
+| `43fad1b` | Prisma read-op 30s timeout + chatbot fan-out cache + auto-heal hook + global `fetch` instrument | `repository.service.ts`, `chatbot.controller.ts`, `instance-tracker.ts`, `global-fetch-instrument.ts` |
+| **`7cb09d4`** | **v3.1: snapshot blind-spots closed** — sliding-window error counters, `connection.update` flood dedup, `ZOMBIE_GAP_MS` 600s→180s, ring buffer in uncaughtException dump, `fetch.error` emission, observer pub/sub | `forensic-logger.ts`, `instance-tracker.ts`, `error.config.ts`, `global-fetch-instrument.ts` |
+
+### Operator-side changes also applied
+
+- **Postgres**: `ALTER SYSTEM SET idle_session_timeout = 0` + `pg_reload_conf()` on `postgres-yxrk4h8hy4tg5vpeaj11qx47`. Persisted in `postgresql.auto.conf`. **This was the underlying amplifier** — was `60000` (sockets killed every 60s in pool).
+- **Coolify env (already set)**: `FORENSIC_AUTO_HEAL_AFTER_MS=180000`, `FORENSIC_ZOMBIE_GAP_MS=180000`, `PRISMA_QUERY_TIMEOUT_MS=30000`, `FORENSIC_LOG_DIR=/evolution/forensic`, `DATABASE_CONNECTION_URI ?connection_limit=20&pool_timeout=10&statement_timeout=60000`.
+- **Coolify env (intentionally NOT set)**: `FORENSIC_AUTO_HEAL=true` — leave OFF until 24h baseline is clean. Then flip in Coolify dashboard.
+
+### What the next AI / next session should check first
+
+Run this single command and look at the bucket counters:
+
+```bash
+curl -s "$EVOLUTION_API_URL/forensic/snapshot" -H "apikey: $EVOLUTION_API_KEY" \
+  | jq '.instances[] | {name, mutexTimeouts, prismaTimeouts, fetchErrors, authStateTimeouts, zombieSuspected, stalledPipeline, msSinceStalledStart, autoHealCount}'
+```
+
+Expected baseline (24h after 2026-05-01 22:30 UTC, i.e. by **2026-05-02 22:30 UTC**):
+- `mutexTimeouts.last1h` — should be **0** (was ~5/h before idle_session_timeout fix)
+- `prismaTimeouts.last1h` — should be **0** (chatbot fan-out cache cuts 7 queries/msg → 1/min)
+- `fetchErrors.last1h` — should be near-0; spikes here are now visible in the snapshot (was the blind spot)
+- `authStateTimeouts.last1h` — should be 0
+- `zombieSuspected: false`, `stalledPipeline: false`
+- `autoHealCount: 0` (auto-heal still disabled by env flag)
+
+If all clean → **flip `FORENSIC_AUTO_HEAL=true`** in Coolify env and recreate the api container.
+
+### What to do if it zombies again before baseline
+
+1. **Pull the snapshot first** — `lastError` on each bucket tells you which subsystem broke. Don't restart yet.
+2. **Tail forensic.jsonl** — `ssh root@157.90.233.12 "tail -200 /data/coolify/figurinha-evolution/forensic/forensic.jsonl | jq -c 'select(.kind | startswith(\"fetch.\") or startswith(\"prisma.\") or startswith(\"baileys.\") or startswith(\"event.\") or startswith(\"autoheal\") or startswith(\"zombie\") or startswith(\"pipeline\") or startswith(\"emergency\") or startswith(\"process\"))'"`
+3. **Note which class it is** (mutex / prisma / fetch / auth-state / something new) and add the new pattern to the table at top of `## TL;DR` below.
+4. **Recovery: same as before** — `docker compose up -d api` from `/data/coolify/services/yxrk4h8hy4tg5vpeaj11qx47/`. Bot reconnects from session files, no QR.
+
+### Build & deploy runbook (current 2026-05-01)
+
+CI auto-build on push to `main` is **broken** (GHCR Actions 403, package-owned-by-manual-push). Build locally:
+
+```bash
+cd /Users/brunobarbosa/Desktop/projects/whatsapp/evolution-api
+git checkout main && git pull fork main
+SHA=$(git rev-parse --short HEAD)
+docker buildx build --platform linux/amd64 --push \
+  -t ghcr.io/brunubarbosa/evolution-api:v2.3.7-sticker-forensic \
+  -t ghcr.io/brunubarbosa/evolution-api:sha-$SHA .
+
+# Then on VPS:
+ssh root@157.90.233.12 'cd /data/coolify/services/yxrk4h8hy4tg5vpeaj11qx47 && \
+  docker tag $(docker inspect api-yxrk4h8hy4tg5vpeaj11qx47 --format "{{.Image}}") \
+  ghcr.io/brunubarbosa/evolution-api:v2.3.7-sticker-forensic-prev && \
+  docker pull ghcr.io/brunubarbosa/evolution-api:v2.3.7-sticker-forensic && \
+  docker compose up -d api'
+```
+
+Verify deploy: features that should be `1`:
+
+```bash
+ssh root@157.90.233.12 '
+docker exec api-yxrk4h8hy4tg5vpeaj11qx47 grep -c PrismaTimeoutError /evolution/dist/api/repository/repository.service.js  # ≥1
+docker exec api-yxrk4h8hy4tg5vpeaj11qx47 grep -c FETCH_LOG_THRESHOLD_MS /evolution/dist/utils/global-fetch-instrument.js  # ≥1
+docker exec api-yxrk4h8hy4tg5vpeaj11qx47 grep -c anyChatbotEnabled /evolution/dist/api/integrations/chatbot/chatbot.controller.js  # ≥1
+docker exec api-yxrk4h8hy4tg5vpeaj11qx47 grep -c last5m /evolution/dist/forensic/instance-tracker.mjs  # ≥1 (proves v3.1)
+'
+```
+
+And confirm new fields appear in `/forensic/snapshot.instances[].{mutexTimeouts,prismaTimeouts,fetchErrors,authStateTimeouts}`.
+
+---
 
 ## TL;DR
 
-The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We've now identified **four** distinct zombie classes:
+The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We've now identified **five** distinct zombie classes:
 
 1. uncaughtException class (patched G4)
 2. Baileys mutex deadlock class (patched v1+v2)
 3. Auth-state Prisma pool exhaustion class (patched v3)
-4. **Chatbot integration fan-out + Prisma pool exhaustion class (patched v4 — 2026-05-01)** ← see `docs/incidents/2026-05-01/`
+4. Chatbot integration fan-out + Prisma pool exhaustion class (patched v4 — 2026-05-01) ← see `docs/incidents/2026-05-01/`
+5. **Postgres `idle_session_timeout` killing pooled connections under low traffic (root-cause amplifier — disabled 2026-05-01 22:11 UTC)** ← see `docs/incidents/2026-05-01-ep5/`
 
 Original 2026-04-30 narrative below — the post-2026-04-30 history is in the incident folder, kept separate so the investigation flow stays readable.
 
