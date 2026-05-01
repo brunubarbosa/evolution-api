@@ -7,13 +7,18 @@ This document is the source of truth for the silent-freeze investigation that co
 
 ## TL;DR
 
-The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We chased it through three theories before landing on the real one:
+The bot looks healthy (container `Up`, DB says `open`) but stops processing messages. WhatsApp tears down the connection ~10 min later. We chased it through **four** theories before landing on the real two:
 
 1. ❌ **First theory:** an undici `terminated` exception killed our event handlers. Patched G4 (handler hardening) — bot stalled again 50 min later, no exception in sight.
 2. ❌ **Second theory:** our forensic detector was off by 1 second (10 min threshold, real stalls happen at 9m59s). Lowering threshold would have detected — but not fixed — the bug.
-3. ✅ **Real cause:** Baileys' internal `processingMutex` (`src/Utils/make-mutex.ts`) has no timeout. When any awaited operation inside its critical section hangs (most likely a Prisma `keys.get/set` for the Signal session store, hammered by a post-reconnect skmsg flood), every subsequent message handler queues forever. **This is a known upstream bug**, fixed by Baileys PR #2137 + #2151 (merged 2025-12-12, unreleased). Latest published Baileys is still rc.9.
+3. ⚠️ **Third theory (partially right):** Baileys' internal `processingMutex` (`src/Utils/make-mutex.ts`) has no timeout. When any awaited operation inside its critical section hangs, every subsequent message handler queues forever. **This is a known upstream bug**, fixed by Baileys PR #2137 + #2151 (merged 2025-12-12, unreleased). We shipped a `patch-package` patch with a 60s `Promise.race` mutex timeout. It worked — caught real hangs in production within minutes — but the bot zombied again **10 minutes later** with no mutex timeout firing.
+4. ✅ **Real root cause (the unblocker for #3):** Prisma connection pool exhaustion. Default pool size 9. Under post-reconnect skmsg flood, multiple `saveCreds` UPDATE Session calls land simultaneously; some get stuck `idle/ClientRead` (committed Postgres-side, awaiting next Node command that never comes). All 9 connections wedge. Every new `keys.get` for the auth-state waits forever on a free connection — **outside any mutex**. The mutex timeout never fires because the await isn't inside the mutex critical section.
 
-Our shipped fix is a **patch-package patch** that adds a 60s `Promise.race` timeout to `makeMutex` — a band-aid version of upstream PR #2151 that we drop the day v7.0.0 stable ships.
+Two shipped fixes:
+- **Patch v1+v2** (`patches/baileys+7.0.0-rc.9.patch`): Promise.race timeout in Baileys' `makeMutex`. Forensic event on fire. Catches the deadlock class.
+- **Patch v3** (`src/utils/use-multi-file-auth-state-prisma.ts`): Promise.race timeout on every Prisma/Redis/fs call in the auth-state. Catches the pool-exhaustion class. Rejects after 15s — Baileys retries — connection eventually returns to pool — bot keeps moving.
+
+Both are application-layer band-aids over upstream issues. Drop them when (a) Baileys v7.0.0 stable ships (mutex fix) and (b) we tune `connection_limit` on the Prisma URL (pool-exhaustion fix).
 
 ## The incident timeline (2026-04-30)
 
@@ -218,15 +223,61 @@ PR #2073 ("no-floating-promises") added `await` eagerly to `messages-recv.ts` pa
 - `m.mutex(() => new Promise(() => {}))` (stuck) rejects with `MutexTimeoutError` after configured ms ✓
 - Next queued call unblocks and runs ✓
 
+## Episode 3 (2026-05-01 01:30 UTC): pool-exhaustion zombie — outside the mutex
+
+After patch v2 deployed, the bot zombied again 10 minutes later. Same observable symptoms (WS frames flow, messages.upsert frozen at 1) **but the mutex timeout never fired**. Smoking gun in `pg_stat_activity`:
+
+```
+pid    | state | wait_event | age      | query
+200515 | idle  | ClientRead | 09:56    | SELECT FROM OpenaiBot ...
+200513 | idle  | ClientRead | 09:49    | SELECT FROM OpenaiSetting ...
+200512 | idle  | ClientRead | 09:49    | SELECT FROM EvolutionBotSetting ...
+200559 | idle  | ClientRead | 09:49    | SELECT FROM TypebotSetting ...
+... (9+ idle/ClientRead connections, all 9-10 min old)
+201360 | idle  | ClientRead | 27 sec   | UPDATE Session SET creds=$1 ...   ← saveCreds
+```
+
+Every Prisma connection in the pool was sitting in `ClientRead` — Postgres-side idle, Node-side never sending the next command. Default Prisma pool size is `num_physical_cpus * 2 + 1` ≈ 9 connections; with all 9 wedged, every new `prisma.session.findUnique` (the auth-state read for every Signal decrypt) waited forever for a free connection. **The await happens outside `processingMutex` — the mutex never saw the hang and our patch couldn't help.**
+
+This is what the four-agent investigation predicted as the *primary suspect* even before we shipped the mutex patch:
+> *"`auth.keys.get/set` (Prisma-backed) stalled on a wedged DB connection, no timeout. Most likely (b)-class trigger."* — agent #3
+
+We just didn't believe it would manifest this fast.
+
+### Patch v3: per-call timeouts on auth-state I/O
+
+`src/utils/use-multi-file-auth-state-prisma.ts` now wraps every Prisma, Redis, and fs operation with `Promise.race` against `AUTHSTATE_IO_TIMEOUT_MS` (default 15s). On timeout:
+
+1. The await rejects with `AuthStateTimeoutError`
+2. The `try { ... } catch { return null }` blocks in the auth-state functions swallow it and return null/false
+3. Baileys' own retry logic handles the missing key (it's already idempotent — every key has a "if not present, generate and store" path)
+4. The connection that was holding the failed query *should* eventually release (Prisma will time out on its own internal `pool_timeout` or the underlying TCP will RST). If not, we still have one fewer pool slot but the bot keeps moving.
+
+Forensic event on every fire:
+
+```json
+{"kind":"authstate.io.timeout","op":"prisma.session.findUnique","sessionId":"figurinha-bot-02","key":"creds","timeoutMs":15000}
+```
+
+That gives us per-operation visibility — we'll know if it's the Prisma session table (creds) or the Redis hSet path (other keys) that hangs.
+
+### What we still didn't do (deeper Prisma fix)
+
+The connection pool config is tunable via the `DATABASE_CONNECTION_URI` env var:
+
+```
+postgresql://...?connection_limit=20&pool_timeout=10
+```
+
+This is owned by Coolify env settings and would require a dashboard change. Recommended once we have a few `authstate.io.timeout` events confirming where the hang lives — we can size pool + pool_timeout accordingly.
+
 ## What we did NOT fix (and probably should)
 
 These are real gaps. Pick one when this comes back:
 
-### 1. Per-call timeout on `authState.keys.get/set` (Evolution-side)
+### 1. Connection pool tuning (the upstream cause)
 
-The mutex is the amplifier; the keystore is the **actual hang site**. Even with the mutex timeout, every 60s a different message will trigger another timeout if Prisma stays sick. Cleaner: wrap each `keys.get/set` in `Promise.race([query, timeout(15s)])`. A 15s Prisma timeout that throws is much better than a 60s mutex timeout that leaks the promise.
-
-File: `src/utils/use-multi-file-auth-state-prisma.ts`. Both `get` and `set` need it.
+The application-layer 15s timeout is treatment, not cure. The pool keeps filling because Prisma doesn't know to release stuck connections. Set `connection_limit=20&pool_timeout=10` on `DATABASE_CONNECTION_URI` in Coolify so pool waiters reject after 10s and pool size grows to give breathing room under retry storms. ~1 line of env config.
 
 ### 2. Watchdog auto-heal
 

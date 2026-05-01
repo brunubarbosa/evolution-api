@@ -3,9 +3,51 @@ import { CacheService } from '@api/services/cache.service';
 import { CacheConf, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { INSTANCE_DIR } from '@config/path.config';
+import { forensic } from '@forensic/forensic-logger';
 import { AuthenticationState, BufferJSON, initAuthCreds, WAProto as proto } from 'baileys';
 import fs from 'fs/promises';
 import path from 'path';
+
+// Auth-state I/O timeout. The 2026-04-30 stall traced to Prisma connections
+// stuck in ClientRead with the connection pool exhausted — every `keys.get`
+// for a Signal session decrypt awaited forever. Baileys' processingMutex
+// timeout doesn't reach here because the await is *outside* the mutex
+// (and even when inside, it leaks rather than fixing the root cause).
+// Wrap every read/write/delete with Promise.race so a stuck connection
+// rejects after AUTHSTATE_IO_TIMEOUT_MS (default 15s). Baileys' own
+// retry/error path then handles it cleanly.
+const AUTHSTATE_IO_TIMEOUT_MS = Number(process.env.AUTHSTATE_IO_TIMEOUT_MS) || 15000;
+
+class AuthStateTimeoutError extends Error {
+  constructor(
+    public readonly op: string,
+    ms: number,
+    public readonly sessionId: string,
+    public readonly key?: string,
+  ) {
+    super(`auth-state ${op} did not resolve within ${ms}ms`);
+    this.name = 'AuthStateTimeoutError';
+  }
+}
+
+function withIoTimeout<T>(op: string, sessionId: string, key: string | undefined, work: Promise<T>): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timer = setTimeout(() => {
+      forensic({
+        kind: 'authstate.io.timeout',
+        op,
+        sessionId,
+        key: key ?? null,
+        timeoutMs: AUTHSTATE_IO_TIMEOUT_MS,
+      }).catch(() => {});
+      reject(new AuthStateTimeoutError(op, AUTHSTATE_IO_TIMEOUT_MS, sessionId, key));
+    }, AUTHSTATE_IO_TIMEOUT_MS);
+  });
+  return Promise.race([work, timeoutPromise]).finally(() => {
+    if (timer) clearTimeout(timer);
+  }) as Promise<T>;
+}
 
 const fixFileName = (file: string): string | undefined => {
   if (!file) {
@@ -18,7 +60,12 @@ const fixFileName = (file: string): string | undefined => {
 
 export async function keyExists(sessionId: string): Promise<any> {
   try {
-    const key = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+    const key = await withIoTimeout(
+      'prisma.session.findUnique',
+      sessionId,
+      'creds',
+      prismaRepository.session.findUnique({ where: { sessionId: sessionId } }),
+    );
     return !!key;
   } catch {
     return false;
@@ -29,16 +76,26 @@ export async function saveKey(sessionId: string, keyJson: any): Promise<any> {
   const exists = await keyExists(sessionId);
   try {
     if (!exists)
-      return await prismaRepository.session.create({
-        data: {
-          sessionId: sessionId,
-          creds: JSON.stringify(keyJson),
-        },
-      });
-    await prismaRepository.session.update({
-      where: { sessionId: sessionId },
-      data: { creds: JSON.stringify(keyJson) },
-    });
+      return await withIoTimeout(
+        'prisma.session.create',
+        sessionId,
+        'creds',
+        prismaRepository.session.create({
+          data: {
+            sessionId: sessionId,
+            creds: JSON.stringify(keyJson),
+          },
+        }),
+      );
+    await withIoTimeout(
+      'prisma.session.update',
+      sessionId,
+      'creds',
+      prismaRepository.session.update({
+        where: { sessionId: sessionId },
+        data: { creds: JSON.stringify(keyJson) },
+      }),
+    );
   } catch {
     return null;
   }
@@ -48,7 +105,12 @@ export async function getAuthKey(sessionId: string): Promise<any> {
   try {
     const register = await keyExists(sessionId);
     if (!register) return null;
-    const auth = await prismaRepository.session.findUnique({ where: { sessionId: sessionId } });
+    const auth = await withIoTimeout(
+      'prisma.session.findUnique',
+      sessionId,
+      'creds',
+      prismaRepository.session.findUnique({ where: { sessionId: sessionId } }),
+    );
     return JSON.parse(auth?.creds);
   } catch {
     return null;
@@ -59,7 +121,12 @@ async function deleteAuthKey(sessionId: string): Promise<any> {
   try {
     const register = await keyExists(sessionId);
     if (!register) return;
-    await prismaRepository.session.delete({ where: { sessionId: sessionId } });
+    await withIoTimeout(
+      'prisma.session.delete',
+      sessionId,
+      'creds',
+      prismaRepository.session.delete({ where: { sessionId: sessionId } }),
+    );
   } catch {
     return;
   }
@@ -94,9 +161,9 @@ export default async function useMultiFileAuthStatePrisma(
 
     if (key != 'creds') {
       if (cacheConfig.REDIS.ENABLED) {
-        return await cache.hSet(sessionId, key, data);
+        return await withIoTimeout('redis.hSet', sessionId, key, cache.hSet(sessionId, key, data));
       } else {
-        await fs.writeFile(localFile(key), dataString);
+        await withIoTimeout('fs.writeFile', sessionId, key, fs.writeFile(localFile(key), dataString));
         return;
       }
     }
@@ -111,10 +178,15 @@ export default async function useMultiFileAuthStatePrisma(
 
       if (key != 'creds') {
         if (cacheConfig.REDIS.ENABLED) {
-          return await cache.hGet(sessionId, key);
+          return await withIoTimeout('redis.hGet', sessionId, key, cache.hGet(sessionId, key));
         } else {
           if (!(await fileExists(localFile(key)))) return null;
-          rawData = await fs.readFile(localFile(key), { encoding: 'utf-8' });
+          rawData = await withIoTimeout(
+            'fs.readFile',
+            sessionId,
+            key,
+            fs.readFile(localFile(key), { encoding: 'utf-8' }),
+          );
           return JSON.parse(rawData, BufferJSON.reviver);
         }
       } else {
@@ -134,9 +206,9 @@ export default async function useMultiFileAuthStatePrisma(
 
       if (key != 'creds') {
         if (cacheConfig.REDIS.ENABLED) {
-          return await cache.hDelete(sessionId, key);
+          return await withIoTimeout('redis.hDelete', sessionId, key, cache.hDelete(sessionId, key));
         } else {
-          await fs.unlink(localFile(key));
+          await withIoTimeout('fs.unlink', sessionId, key, fs.unlink(localFile(key)));
         }
       } else {
         await deleteAuthKey(sessionId);
