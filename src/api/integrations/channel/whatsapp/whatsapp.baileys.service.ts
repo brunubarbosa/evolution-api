@@ -1828,13 +1828,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
     'group-participants.update': async (participantsUpdate: {
       id: string;
+      author?: string;
+      authorPn?: string;
       participants: string[];
       action: ParticipantAction;
     }) => {
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
       // MAINTAINS: participants: string[] (original JID strings)
       // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
-      // This enables LID to phoneNumber conversion without breaking existing webhook consumers
+      // ADDS (GDW fork): author, authorPn, authorData — preserves the actor JID Baileys reports on
+      // <notification participant="..." participant_pn="..."> stanzas. Upstream silently drops these.
+      // This is what powers "X added Y" attribution.
 
       // Helper to normalize participantId as phone number
       const normalizePhoneNumber = (id: string | null | undefined): string => {
@@ -1851,31 +1855,37 @@ export class BaileysStartupService extends ChannelStartupService {
           throw new Error('Invalid participant data received from findParticipants');
         }
 
-        // Filtra apenas os participantes que estão no evento
-        const resolvedParticipants = participantsUpdate.participants.map((participantId) => {
-          const participantData = groupParticipants.participants.find((p) => p.id === participantId);
-
-          let phoneNumber: string;
-          if (participantData?.phoneNumber) {
-            phoneNumber = participantData.phoneNumber;
-          } else {
-            phoneNumber = normalizePhoneNumber(participantId);
-          }
-
+        const resolveOne = (jid: string | undefined) => {
+          if (!jid) return undefined;
+          const found = groupParticipants.participants.find((p) => p.id === jid);
           return {
-            jid: participantId,
-            phoneNumber,
-            name: participantData?.name,
-            imgUrl: participantData?.imgUrl,
+            jid,
+            phoneNumber: found?.phoneNumber || normalizePhoneNumber(jid),
+            name: found?.name,
+            imgUrl: found?.imgUrl,
           };
-        });
+        };
+
+        // Filtra apenas os participantes que estão no evento
+        const resolvedParticipants = participantsUpdate.participants.map((participantId) => resolveOne(participantId)!);
+
+        // Author may not be in the current participant list (e.g. they removed themselves
+        // or added someone via invite link). Fall back to authorPn for the phone number.
+        const authorData =
+          resolveOne(participantsUpdate.author) ||
+          (participantsUpdate.authorPn
+            ? { jid: participantsUpdate.author, phoneNumber: normalizePhoneNumber(participantsUpdate.authorPn) }
+            : undefined);
 
         // Mantém formato original + adiciona dados resolvidos
         const enhancedParticipantsUpdate = {
           ...participantsUpdate,
           participants: participantsUpdate.participants, // Mantém array original de strings
+          author: participantsUpdate.author,
+          authorPn: participantsUpdate.authorPn,
           // Adiciona dados resolvidos em campo separado
           participantsData: resolvedParticipants,
+          authorData,
         };
 
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, enhancedParticipantsUpdate);
@@ -1883,7 +1893,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.error(
           `Failed to resolve participant data for GROUP_PARTICIPANTS_UPDATE webhook: ${error.message} | Group: ${participantsUpdate.id} | Participants: ${participantsUpdate.participants.length}`,
         );
-        // Fallback - envia sem conversão
+        // Fallback - envia sem conversão (still preserves author/authorPn since we spread the full update)
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
       }
 
