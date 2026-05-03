@@ -83,34 +83,59 @@ jobs:
             gdw.branch=${{ github.ref_name }}
             gdw.upstream_base=${{ steps.tag.outputs.value }}
 
-      - name: Smoke test (boot image, hit /)
+      - name: Smoke test (boot image with throwaway Postgres, hit /)
         run: |
           set -euo pipefail
-          # Evolution needs a DB to boot; for the smoke test we point it at an in-memory
-          # SQLite path so it can at least start the HTTP server. If config requires
-          # postgres URI, skip and check binary boot instead.
-          docker run -d --name smoke -p 18080:8080 \
+          # Evolution requires a real DB to bootstrap (DATABASE_ENABLED=false
+          # still trips bootstrap validation in v2.x). We boot a throwaway
+          # Postgres on a Docker network so the smoke test verifies the
+          # binary starts AND can reach a DB — same failure surface as prod.
+          docker network create smoke-net
+          docker run -d --name smoke-pg --network smoke-net \
+            -e POSTGRES_USER=evolution \
+            -e POSTGRES_PASSWORD=smoke \
+            -e POSTGRES_DB=evolution \
+            postgres:16-alpine
+
+          # Wait for Postgres readiness.
+          for i in $(seq 1 20); do
+            if docker exec smoke-pg pg_isready -U evolution >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          docker run -d --name smoke --network smoke-net -p 18080:8080 \
             -e SERVER_TYPE=http \
             -e SERVER_PORT=8080 \
+            -e SERVER_URL=http://localhost:18080 \
             -e AUTHENTICATION_API_KEY=smoke-test-key \
-            -e DATABASE_ENABLED=false \
+            -e DATABASE_ENABLED=true \
+            -e DATABASE_PROVIDER=postgresql \
+            -e DATABASE_CONNECTION_URI=postgresql://evolution:smoke@smoke-pg:5432/evolution \
+            -e DATABASE_CONNECTION_CLIENT_NAME=smoke \
             -e CACHE_REDIS_ENABLED=false \
             -e CACHE_LOCAL_ENABLED=true \
-            gdw-evolution:smoke || (docker logs smoke; exit 1)
+            -e LOG_LEVEL=ERROR \
+            gdw-evolution:smoke
 
-          # Poll for up to 60s waiting for HTTP to come up.
-          for i in $(seq 1 30); do
+          cleanup() {
+            docker logs smoke 2>&1 | tail -80 || true
+            docker stop smoke smoke-pg >/dev/null 2>&1 || true
+            docker rm   smoke smoke-pg >/dev/null 2>&1 || true
+            docker network rm smoke-net >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          # Poll for up to 90s waiting for HTTP to come up (Prisma init takes time).
+          for i in $(seq 1 45); do
             if curl -fsS http://localhost:18080/ >/dev/null 2>&1; then
               echo "Smoke OK after ${i} attempts"
               curl -sS http://localhost:18080/ | head -c 200
-              docker stop smoke && docker rm smoke
               exit 0
             fi
             sleep 2
           done
 
           echo "::error::Smoke test failed — image did not respond on /"
-          docker logs smoke
           exit 1
 
       - name: Trivy vulnerability scan (HIGH/CRITICAL)
