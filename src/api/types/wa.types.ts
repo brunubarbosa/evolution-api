@@ -27,7 +27,7 @@ export enum Events {
   GROUPS_UPSERT = 'groups.upsert',
   GROUPS_UPDATE = 'groups.update',
   GROUP_PARTICIPANTS_UPDATE = 'group-participants.update',
-  GROUP_JOIN_REQUEST = 'group.join-request',
+  GROUP_JOIN_REQUEST = 'group.join-request', // [GDW] see PATCHES.md GDW-002
   CALL = 'call',
   TYPEBOT_START = 'typebot.start',
   TYPEBOT_CHANGE_STATUS = 'typebot.change-status',

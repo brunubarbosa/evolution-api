@@ -1836,9 +1836,11 @@ export class BaileysStartupService extends ChannelStartupService {
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
       // MAINTAINS: participants: string[] (original JID strings)
       // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
-      // ADDS (GDW fork): author, authorPn, authorData — preserves the actor JID Baileys reports on
-      // <notification participant="..." participant_pn="..."> stanzas. Upstream silently drops these.
-      // This is what powers "X added Y" attribution.
+      //
+      // [GDW] author/authorPn/authorData. Preserves the actor JID that Baileys
+      // reports on <notification participant="..." participant_pn="..."> stanzas.
+      // Upstream silently drops these. Powers "X added Y" attribution.
+      // See PATCHES.md GDW-001.
 
       // Helper to normalize participantId as phone number
       const normalizePhoneNumber = (id: string | null | undefined): string => {
@@ -1900,11 +1902,12 @@ export class BaileysStartupService extends ChannelStartupService {
       this.updateGroupMetadataCache(participantsUpdate.id);
     },
 
-    // GDW fork: Baileys emits group.join-request when a user requests to join
-    // (or is added) and an admin approves/revokes/rejects. Upstream Evolution
-    // never wires this up, so the event is silently dropped. Forwarding it as-is
-    // gives the worker visibility into approval flows + invite_link vs non_admin_add
-    // distinction (the `method` field).
+    // [GDW] group.join-request listener. Baileys emits this when a user
+    // requests to join (or is added by a non-admin) and when an admin
+    // approves/revokes/rejects. Upstream Evolution wires no listener, so
+    // the event is silently dropped. Forwarding it gives the worker
+    // visibility into approval flows + invite_link vs non_admin_add
+    // distinction (the `method` field). See PATCHES.md GDW-002.
     'group.join-request': async (joinRequest: {
       id: string;
       author?: string;
@@ -2102,6 +2105,7 @@ export class BaileysStartupService extends ChannelStartupService {
                   safe('group-participants.update', this.groupHandler['group-participants.update'](payload));
                 }
 
+                // [GDW] PATCHES.md GDW-002 — dispatch group.join-request to our handler.
                 if (events['group.join-request']) {
                   const payload = events['group.join-request'] as any;
                   safe('group.join-request', this.groupHandler['group.join-request'](payload));

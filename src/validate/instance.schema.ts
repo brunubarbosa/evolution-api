@@ -80,7 +80,8 @@ export const instanceSchema: JSONSchema7 = {
           'GROUPS_UPSERT',
           'GROUP_UPDATE',
           'GROUP_PARTICIPANTS_UPDATE',
-          'GROUP_JOIN_REQUEST',
+          'GROUP_JOIN_REQUEST', // [GDW] PATCHES.md GDW-002
+
           'CONNECTION_UPDATE',
           'LABELS_EDIT',
           'LABELS_ASSOCIATION',
@@ -118,7 +119,8 @@ export const instanceSchema: JSONSchema7 = {
           'GROUPS_UPSERT',
           'GROUP_UPDATE',
           'GROUP_PARTICIPANTS_UPDATE',
-          'GROUP_JOIN_REQUEST',
+          'GROUP_JOIN_REQUEST', // [GDW] PATCHES.md GDW-002
+
           'CONNECTION_UPDATE',
           'LABELS_EDIT',
           'LABELS_ASSOCIATION',
@@ -156,7 +158,8 @@ export const instanceSchema: JSONSchema7 = {
           'GROUPS_UPSERT',
           'GROUP_UPDATE',
           'GROUP_PARTICIPANTS_UPDATE',
-          'GROUP_JOIN_REQUEST',
+          'GROUP_JOIN_REQUEST', // [GDW] PATCHES.md GDW-002
+
           'CONNECTION_UPDATE',
           'LABELS_EDIT',
           'LABELS_ASSOCIATION',
@@ -194,7 +197,8 @@ export const instanceSchema: JSONSchema7 = {
           'GROUPS_UPSERT',
           'GROUP_UPDATE',
           'GROUP_PARTICIPANTS_UPDATE',
-          'GROUP_JOIN_REQUEST',
+          'GROUP_JOIN_REQUEST', // [GDW] PATCHES.md GDW-002
+
           'CONNECTION_UPDATE',
           'LABELS_EDIT',
           'LABELS_ASSOCIATION',
