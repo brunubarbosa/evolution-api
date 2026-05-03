@@ -1899,6 +1899,21 @@ export class BaileysStartupService extends ChannelStartupService {
 
       this.updateGroupMetadataCache(participantsUpdate.id);
     },
+
+    // GDW fork: Baileys emits group.join-request when a user requests to join
+    // (or is added) and an admin approves/revokes/rejects. Upstream Evolution
+    // never wires this up, so the event is silently dropped. Forwarding it as-is
+    // gives the worker visibility into approval flows + invite_link vs non_admin_add
+    // distinction (the `method` field).
+    'group.join-request': async (joinRequest: {
+      id: string;
+      author?: string;
+      participant: string;
+      action: 'created' | 'revoked' | 'rejected';
+      method?: 'invite_link' | 'non_admin_add' | string;
+    }) => {
+      this.sendDataWebhook(Events.GROUP_JOIN_REQUEST, joinRequest);
+    },
   };
 
   private readonly labelHandle = {
@@ -2085,6 +2100,11 @@ export class BaileysStartupService extends ChannelStartupService {
                 if (events['group-participants.update']) {
                   const payload = events['group-participants.update'] as any;
                   safe('group-participants.update', this.groupHandler['group-participants.update'](payload));
+                }
+
+                if (events['group.join-request']) {
+                  const payload = events['group.join-request'] as any;
+                  safe('group.join-request', this.groupHandler['group.join-request'](payload));
                 }
               }
 
