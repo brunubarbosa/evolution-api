@@ -154,6 +154,13 @@ jobs:
           severity: HIGH,CRITICAL
           ignore-unfixed: true
 
+      # We disable buildkit's inline `provenance` + `sbom` attestations because
+      # they ship as a separate manifest in the same image index and GHCR was
+      # 403-rejecting our attestation blob push (run 25293536998). Pre-existing
+      # private packages can require manual repo-link permissions to accept
+      # attestation manifests. Instead we sign the manifest with cosign and
+      # attach an SBOM as a workflow artifact (anchore step below). That gives
+      # us identical security posture without the manifest-format mismatch.
       - name: Build and push (multi-tag)
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6
@@ -170,8 +177,8 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             gdw.branch=${{ github.ref_name }}
             gdw.upstream_base=${{ steps.tag.outputs.value }}
-          provenance: true
-          sbom: true
+          provenance: false
+          sbom: false
 
       - name: Install cosign
         uses: sigstore/cosign-installer@f713795cb21599bc4e5c4b58cbad1da852d7eeb9  # v3
