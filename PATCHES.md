@@ -38,7 +38,12 @@ The full playbook for adding patches lives at `grupodewhatsapp/docs/evolution-fo
 
 ## GDW-003 — fork hardening retrofit (operational)
 
-- **Commit:** *(this branch HEAD — see git log)*
+- **Commit:** `fb4f4d6` deployed to prod 2026-05-03 21:31 UTC.
+- **Production digest:** `ghcr.io/brunubarbosa/evolution-api@sha256:1e02bc5ac736290ce50e2ea703cedb937a25d6ddf1c687a33087b4be6ea16a1f`
+- **Previous prod image (rollback target):** `atendai/evolution-api:v2.2.3`
+  - To roll back: Coolify → service `gdg2okn1nxvpd1tybsjnbj50` → edit docker-compose, replace the `evolution-api` service `image:` line with `'atendai/evolution-api:v2.2.3'`, redeploy. Postgres/Redis volumes persist.
+- **Verification:** `https://evolution-api.grupodewhatsapp.com/` returned `{status:200, version:"2.3.7"}`. Existing instance `test` reconnected without data loss.
+
 - **Adds:** Operational scaffolding required before scaling to more patches.
   - Branch rename `feat/gdw` → `vendor/gdw`
   - CI workflow hardening (SHA-pinned actions, lockfile check, smoke test, Trivy scan, cosign signing, SBOM)
