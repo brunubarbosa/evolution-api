@@ -88,6 +88,7 @@ export type EventsRabbitmq = {
   GROUPS_UPSERT: boolean;
   GROUP_UPDATE: boolean;
   GROUP_PARTICIPANTS_UPDATE: boolean;
+  GROUP_JOIN_REQUEST: boolean; // [GDW] PATCHES.md GDW-002
   CALL: boolean;
   TYPEBOT_START: boolean;
   TYPEBOT_CHANGE_STATUS: boolean;
@@ -134,6 +135,7 @@ export type Sqs = {
     CONTACTS_UPDATE: boolean;
     CONTACTS_UPSERT: boolean;
     GROUP_PARTICIPANTS_UPDATE: boolean;
+    GROUP_JOIN_REQUEST: boolean; // [GDW] PATCHES.md GDW-002
     GROUPS_UPDATE: boolean;
     GROUPS_UPSERT: boolean;
     LABELS_ASSOCIATION: boolean;
@@ -220,6 +222,7 @@ export type EventsWebhook = {
   GROUPS_UPSERT: boolean;
   GROUP_UPDATE: boolean;
   GROUP_PARTICIPANTS_UPDATE: boolean;
+  GROUP_JOIN_REQUEST: boolean; // [GDW] PATCHES.md GDW-002
   CALL: boolean;
   TYPEBOT_START: boolean;
   TYPEBOT_CHANGE_STATUS: boolean;
@@ -253,6 +256,7 @@ export type EventsPusher = {
   GROUPS_UPSERT: boolean;
   GROUP_UPDATE: boolean;
   GROUP_PARTICIPANTS_UPDATE: boolean;
+  GROUP_JOIN_REQUEST: boolean; // [GDW] PATCHES.md GDW-002
   CALL: boolean;
   TYPEBOT_START: boolean;
   TYPEBOT_CHANGE_STATUS: boolean;
@@ -534,6 +538,7 @@ export class ConfigService {
           GROUPS_UPSERT: process.env?.RABBITMQ_EVENTS_GROUPS_UPSERT === 'true',
           GROUP_UPDATE: process.env?.RABBITMQ_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.RABBITMQ_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.RABBITMQ_EVENTS_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           CALL: process.env?.RABBITMQ_EVENTS_CALL === 'true',
           TYPEBOT_START: process.env?.RABBITMQ_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.RABBITMQ_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
@@ -571,6 +576,7 @@ export class ConfigService {
           GROUPS_UPSERT: process.env?.NATS_EVENTS_GROUPS_UPSERT === 'true',
           GROUP_UPDATE: process.env?.NATS_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.NATS_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.NATS_EVENTS_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           CALL: process.env?.NATS_EVENTS_CALL === 'true',
           TYPEBOT_START: process.env?.NATS_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.NATS_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
@@ -598,6 +604,7 @@ export class ConfigService {
           CONTACTS_UPDATE: process.env?.SQS_GLOBAL_CONTACTS_UPDATE === 'true',
           CONTACTS_UPSERT: process.env?.SQS_GLOBAL_CONTACTS_UPSERT === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.SQS_GLOBAL_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.SQS_GLOBAL_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           GROUPS_UPDATE: process.env?.SQS_GLOBAL_GROUPS_UPDATE === 'true',
           GROUPS_UPSERT: process.env?.SQS_GLOBAL_GROUPS_UPSERT === 'true',
           LABELS_ASSOCIATION: process.env?.SQS_GLOBAL_LABELS_ASSOCIATION === 'true',
@@ -654,6 +661,7 @@ export class ConfigService {
           GROUPS_UPSERT: process.env?.KAFKA_EVENTS_GROUPS_UPSERT === 'true',
           GROUP_UPDATE: process.env?.KAFKA_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.KAFKA_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.KAFKA_EVENTS_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           CALL: process.env?.KAFKA_EVENTS_CALL === 'true',
           TYPEBOT_START: process.env?.KAFKA_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.KAFKA_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
@@ -719,6 +727,7 @@ export class ConfigService {
           GROUPS_UPSERT: process.env?.PUSHER_EVENTS_GROUPS_UPSERT === 'true',
           GROUP_UPDATE: process.env?.PUSHER_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.PUSHER_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.PUSHER_EVENTS_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           CALL: process.env?.PUSHER_EVENTS_CALL === 'true',
           TYPEBOT_START: process.env?.PUSHER_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.PUSHER_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
@@ -776,6 +785,7 @@ export class ConfigService {
           GROUPS_UPSERT: process.env?.WEBHOOK_EVENTS_GROUPS_UPSERT === 'true',
           GROUP_UPDATE: process.env?.WEBHOOK_EVENTS_GROUPS_UPDATE === 'true',
           GROUP_PARTICIPANTS_UPDATE: process.env?.WEBHOOK_EVENTS_GROUP_PARTICIPANTS_UPDATE === 'true',
+          GROUP_JOIN_REQUEST: process.env?.WEBHOOK_EVENTS_GROUP_JOIN_REQUEST === 'true', // [GDW] PATCHES.md GDW-002
           CALL: process.env?.WEBHOOK_EVENTS_CALL === 'true',
           TYPEBOT_START: process.env?.WEBHOOK_EVENTS_TYPEBOT_START === 'true',
           TYPEBOT_CHANGE_STATUS: process.env?.WEBHOOK_EVENTS_TYPEBOT_CHANGE_STATUS === 'true',
