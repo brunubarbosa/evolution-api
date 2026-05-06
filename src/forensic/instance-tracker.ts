@@ -392,6 +392,28 @@ class InstanceTracker {
     return this.map.get(name)?.clientGen ?? 0;
   }
 
+  // 2026-05-06 v4.2: invoke the registered forceClose hook for stress
+  // testing. Wired through a debug endpoint (env-gated) so the listener-leak
+  // test harness can deterministically trigger N consecutive reinits and
+  // observe whether wsListenerCount/evListenerCount stay flat. Returns
+  // false if there's no hook (cloud channel, or instance not yet booted).
+  triggerForceCloseFromDebug(name: string, reason: string): boolean {
+    const s = this.map.get(name);
+    if (!s || typeof s.forceClose !== 'function') return false;
+    try {
+      s.forceClose(`debug:${reason}`);
+      return true;
+    } catch (err: any) {
+      forensic({
+        kind: 'debug.forceclose.error',
+        instance: name,
+        reason,
+        error: { message: err?.message, stack: err?.stack?.split('\n').slice(0, 4).join('\n') },
+      }).catch(() => {});
+      return false;
+    }
+  }
+
   // 2026-05-06 v4: post-reinit zombie-rebirth probe. Called by the autoheal
   // path after reinit.success — schedules a check at probeMs to verify the
   // new generation actually saw a connection.update {open}. If not, emits

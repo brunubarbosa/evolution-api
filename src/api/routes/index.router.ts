@@ -17,6 +17,8 @@ import path from 'path';
 import { BusinessRouter } from './business.router';
 import { CallRouter } from './call.router';
 import { ChatRouter } from './chat.router';
+// [GDW-007] Community router — REST surface for Baileys' communities.* methods.
+import { CommunityRouter } from './community.router';
 import { GroupRouter } from './group.router';
 import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
@@ -208,6 +210,27 @@ router
   .get('/forensic/snapshot', authGuard['apikey'], (_req, res) => {
     res.status(HttpStatus.OK).json(instanceTracker.snapshot());
   })
+  // 2026-05-06 v4.2: debug-only forceclose endpoint for stress testing
+  // listener-leak hypothesis. Gated by FORENSIC_DEBUG_ENDPOINTS=true so
+  // it is inert in production. Triggers the same forceClose hook that
+  // the heartbeat autoheal calls, deterministically advancing the
+  // clientGen and exercising the v4 cleanup path.
+  //
+  // POST /forensic/debug/forceclose/:instanceName
+  // Body: { reason?: string }  (default: "manual-stress")
+  // Returns: { triggered: boolean, clientGenBefore: number }
+  .post('/forensic/debug/forceclose/:instanceName', authGuard['apikey'], (req, res) => {
+    if (String(process.env.FORENSIC_DEBUG_ENDPOINTS ?? '').toLowerCase() !== 'true') {
+      return res.status(HttpStatus.NOT_FOUND).json({ error: 'debug endpoints disabled' });
+    }
+    const name = req.params.instanceName;
+    const reason = (req.body as any)?.reason ?? 'manual-stress';
+    const clientGenBefore = instanceTracker.currentClientGen(name);
+    const triggered = instanceTracker.triggerForceCloseFromDebug(name, reason);
+    return res
+      .status(triggered ? HttpStatus.OK : HttpStatus.NOT_FOUND)
+      .json({ triggered, clientGenBefore, instance: name, reason });
+  })
   .post('/verify-creds', authGuard['apikey'], async (req, res) => {
     const facebookConfig = configService.get<Facebook>('FACEBOOK');
     return res.status(HttpStatus.OK).json({
@@ -224,6 +247,8 @@ router
   .use('/chat', new ChatRouter(...guards).router)
   .use('/business', new BusinessRouter(...guards).router)
   .use('/group', new GroupRouter(...guards).router)
+  // [GDW-007] /community/* surface — see PATCHES.md.
+  .use('/community', new CommunityRouter(...guards).router)
   .use('/template', new TemplateRouter(configService, ...guards).router)
   .use('/settings', new SettingsRouter(...guards).router)
   .use('/proxy', new ProxyRouter(...guards).router)
