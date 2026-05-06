@@ -1,14 +1,19 @@
 diff --git a/node_modules/baileys/lib/Utils/make-mutex.js b/node_modules/baileys/lib/Utils/make-mutex.js
-index 768f14f..340a974 100644
+index 768f14f..8d826b6 100644
 --- a/node_modules/baileys/lib/Utils/make-mutex.js
 +++ b/node_modules/baileys/lib/Utils/make-mutex.js
-@@ -1,27 +1,70 @@
+@@ -1,27 +1,88 @@
 +// figurinha-fork patch: Promise.race timeout on every mutex acquisition.
 +// Upstream rc.9 has no timeout — a stuck await locks the queue forever.
 +// See PR #2151 (replaces with async-mutex; merged on master, unreleased).
 +// We keep the original API; on timeout, the held slot rejects so the next
 +// queued caller proceeds. The runaway code() promise is intentionally leaked
 +// (still running, but no longer blocking the queue).
++//
++// 2026-05-06 v4: also capture the CALLER'S stack at code() start. The
++// timeout error's stack always points at setTimeout — useless for
++// attribution. The caller stack tells us which Baileys callsite
++// (Socket/messages-recv.ts:1070, Socket/chats.ts:751, etc.) is wedged.
 +import { appendFileSync } from 'fs';
 +const DEFAULT_MUTEX_TIMEOUT_MS = Number(process.env.BAILEYS_MUTEX_TIMEOUT_MS) || 60000;
 +// Write a forensic event when the timeout fires. Direct fs.appendFileSync
@@ -18,14 +23,22 @@ index 768f14f..340a974 100644
 +const TIMEOUT_LOG_PATH = process.env.FORENSIC_LOG_DIR
 +    ? `${process.env.FORENSIC_LOG_DIR}/forensic.jsonl`
 +    : '/evolution/forensic/forensic.jsonl';
-+function logTimeout(stack) {
++function logTimeout(timerStack, callerStack) {
 +    try {
 +        const line = JSON.stringify({
 +            ts: new Date().toISOString(),
 +            pid: process.pid,
 +            kind: 'baileys.mutex.timeout',
 +            timeoutMs: DEFAULT_MUTEX_TIMEOUT_MS,
-+            stack: stack ? stack.split('\n').slice(0, 8).join('\n') : null,
++            // The setTimeout stack — kept for backwards-compat with existing
++            // grep patterns. Always points at make-mutex.js itself.
++            stack: timerStack ? timerStack.split('\n').slice(0, 8).join('\n') : null,
++            // The caller's stack captured at code() start. Tells us which
++            // Baileys callsite is wedged. WITHOUT this we can't tell whether
++            // a timeout came from message decryption, history sync, retry
++            // handling, or chat list processing — they all share the same
++            // processingMutex.
++            callerStack: callerStack ? callerStack.split('\n').slice(0, 12).join('\n') : null,
 +        }) + '\n';
 +        appendFileSync(TIMEOUT_LOG_PATH, line);
 +    }
@@ -43,6 +56,11 @@ index 768f14f..340a974 100644
 -    let taskTimeout;
      return {
          mutex(code) {
++            // Capture the caller's stack at acquisition time — this points
++            // at the Baileys callsite (messages-recv.ts:1070, chats.ts:751,
++            // etc.), not at setTimeout. Without it, every timeout looks the
++            // same and we can't tell which queued task wedged the mutex.
++            const callerStack = new Error('mutex-acquire').stack;
              task = (async () => {
 -                // wait for the previous task to complete
 -                // if there is an error, we swallow so as to not block the queue
@@ -66,7 +84,7 @@ index 768f14f..340a974 100644
                  }
 +                catch (err) {
 +                    if (timedOut) {
-+                        logTimeout(err && err.stack);
++                        logTimeout(err && err.stack, callerStack);
 +                    }
 +                    throw err;
 +                }

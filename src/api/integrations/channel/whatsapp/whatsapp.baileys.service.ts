@@ -15,18 +15,38 @@ import {
   UpdateMessageDto,
   WhatsAppNumberDto,
 } from '@api/dto/chat.dto';
+// [GDW-007] Community DTOs.
+import {
+  CommunityAcceptInviteV4Dto,
+  CommunityCreateDto,
+  CommunityCreateGroupDto,
+  CommunityDescriptionDto,
+  CommunityInviteCode,
+  CommunityJid,
+  CommunityLinkGroupDto,
+  CommunityRevokeInviteV4Dto,
+  CommunitySubjectDto,
+  CommunityUpdateParticipantsDto,
+  CommunityUpdatePendingRequestsDto,
+} from '@api/dto/community.dto';
 import {
   AcceptGroupInvite,
   CreateGroupDto,
   GetParticipant,
+  // [GDW-004] Join-request action DTOs
+  GroupAcceptInviteV4Dto,
   GroupDescriptionDto,
   GroupInvite,
   GroupJid,
+  GroupJoinApprovalModeDto,
+  GroupMemberAddModeDto,
   GroupPictureDto,
+  GroupRevokeInviteV4Dto,
   GroupSendInvite,
   GroupSubjectDto,
   GroupToggleEphemeralDto,
   GroupUpdateParticipantDto,
+  GroupUpdatePendingRequestsDto,
   GroupUpdateSettingDto,
 } from '@api/dto/group.dto';
 import { InstanceDto, SetPresenceDto } from '@api/dto/instance.dto';
@@ -59,6 +79,8 @@ import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
+// [GDW-008] Best-effort persistence for group events (env-gated).
+import { GroupEventPersistenceService } from '@api/services/group-event-persistence.service';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { CacheEngine } from '@cache/cacheengine';
 import {
@@ -155,6 +177,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { classifyDisconnect } from './reconnect-classifier';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -226,8 +249,39 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+// 2026-05-06 v4: read EventEmitter / WebSocket listener counts as a flat
+// {eventName: count} map. Used by the forensic snapshot + autoheal events
+// to surface listener leaks (each reinit accumulating a fresh wave of
+// `connection.update`/`messages.upsert`/`ws.message` handlers on the OLD
+// emitter without detaching them). Returns null on any error — getters
+// race with teardown and we never want forensic IO to break the request
+// path.
+function readEventListenerCounts(emitter: any): Record<string, number> | null {
+  if (!emitter) return null;
+  try {
+    // Prefer the standard EventEmitter API — `eventNames()` + `listenerCount`
+    // is supported on `client.ev` (a Baileys EventEmitter) and on the
+    // underlying `ws` (Node's WebSocket extends EventEmitter).
+    const names: Array<string | symbol> = typeof emitter.eventNames === 'function' ? emitter.eventNames() : [];
+    const out: Record<string, number> = {};
+    let total = 0;
+    for (const n of names) {
+      const key = typeof n === 'symbol' ? (n as symbol).toString() : String(n);
+      const count = typeof emitter.listenerCount === 'function' ? emitter.listenerCount(n) : 0;
+      out[key] = count;
+      total += count;
+    }
+    out.__total = total;
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
+  // [GDW-008] Lazily-bound after super() runs so prismaRepository is set.
+  private groupEventPersistence!: GroupEventPersistenceService;
 
   constructor(
     public readonly configService: ConfigService,
@@ -245,6 +299,10 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
+
+    // [GDW-008] Wire persistence service. Inert (no-op) unless
+    // GDW_PERSIST_GROUP_EVENTS=true. See PATCHES.md GDW-008.
+    this.groupEventPersistence = new GroupEventPersistenceService(this.prismaRepository);
   }
 
   private authStateProvider: AuthStateProvider;
@@ -253,6 +311,25 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+
+  // 2026-05-06 v4.1: client.ev is Baileys' BUFFERED wrapper, not a raw
+  // EventEmitter. Calling `eventNames()` on it returns nothing because the
+  // underlying emitter is private to the wrapper closure. So we can't use
+  // standard EventEmitter introspection to count "event"-channel listeners.
+  // Instead we count manually: capture the unsubscribe returned by
+  // `client.ev.process(...)` and track our own listener bookkeeping.
+  // Reset to {} on each createClient — if it ever exceeds 1 for any key
+  // mid-gen, we have a leak.
+  private evProcessUnsubscribe: (() => void) | null = null;
+  private evListenerBookkeeping: Record<string, number> = {};
+
+  private totalEvListeners(): number {
+    let total = 0;
+    for (const k of Object.keys(this.evListenerBookkeeping)) {
+      total += this.evListenerBookkeeping[k] ?? 0;
+    }
+    return total;
+  }
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -344,6 +421,10 @@ export class BaileysStartupService extends ChannelStartupService {
         errorMessage: err?.message ?? null,
         errorName: err?.name ?? null,
         boomData: err?.data ?? null,
+        // 2026-05-06 v4: tag every transition with the live clientGen.
+        // Lets us cross-reference "client #5 saw connection.update {open}
+        // but client #6–#27 didn't" without parsing autoheal sequences.
+        clientGen: instanceTracker.currentClientGen(this.instance.name),
       });
       if (connection) {
         instanceTracker.setDbStatus(this.instance.name, connection === 'open' ? 'open' : connection);
@@ -444,12 +525,48 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'close') {
-      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const codesToNotReconnect = [DisconnectReason.loggedOut, DisconnectReason.forbidden, 402, 406];
-      const shouldReconnect = !codesToNotReconnect.includes(statusCode);
-      if (shouldReconnect) {
-        await this.connectToWhatsapp(this.phoneNumber);
+      // 📘 RECONNECT FLOW — full context in
+      //   grupodewhatsapp/docs/evolution-fork/reconnect-runbook.md
+      // Three layers of recovery (this is layer 1):
+      //   L1: classifier here picks action+delay, reconnects via setTimeout
+      //   L2: instance-tracker fastpath catches "ws.close, no connection.update"
+      //       within 5s (undici-crash signature)
+      //   L3: instance-tracker auto-heal force-closes after 180s zombie
+      // Plus: flapping guard stops auto-reconnect after 10 attempts in 5min.
+      const boomErr = lastDisconnect?.error as Boom | undefined;
+      const statusCode = boomErr?.output?.statusCode;
+      // Boom's `data` is where the WhatsApp `<conflict tag attrs/>` payload
+      // ends up — needed to distinguish a logout-style 401 from a "another
+      // device replaced you" 401 (which is conflict + device_removed).
+      const errorData = (boomErr as any)?.data;
+      const decision = classifyDisconnect(statusCode, errorData);
+
+      const tracked = instanceTracker.recordReconnectDecision(this.instance.name, decision.action, {
+        reason: decision.reason,
+        statusCode: typeof statusCode === 'number' ? statusCode : null,
+        baseDelayMs: decision.action === 'reconnect' ? decision.baseDelayMs : undefined,
+      });
+
+      if (decision.action === 'reconnect' && tracked.allowed) {
+        const attempt = tracked.attempt;
+        const waitMs = tracked.delayMs ?? 0;
+        this.logger.warn(
+          `[reconnect] ${this.instance.name} close=${statusCode ?? 'null'} reason=${decision.reason} attempt=${attempt} delay=${waitMs}ms`,
+        );
+        setTimeout(() => {
+          this.connectToWhatsapp(this.phoneNumber).catch((err) => {
+            instanceTracker.recordReconnectFailed(this.instance.name, attempt, err?.message ?? String(err));
+            this.logger.error(`[reconnect] ${this.instance.name} attempt=${attempt} failed: ${err?.message ?? err}`);
+          });
+        }, waitMs).unref?.();
       } else {
+        // Terminal — same behavior as before, plus the flapping case where we
+        // refuse to reconnect even though the error is recoverable in theory.
+        if (tracked.flapping) {
+          this.logger.error(
+            `[reconnect] ${this.instance.name} flapping (${decision.reason}); aborting auto-reconnect — operator action required`,
+          );
+        }
         this.sendDataWebhook(Events.STATUS_INSTANCE, {
           instance: this.instance.name,
           status: 'closed',
@@ -485,6 +602,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      // Reconnect succeeded — clear the attempt counter so next disconnect
+      // starts a fresh backoff curve. Also emits a forensic line that lets us
+      // chart "how long did it take to recover?" without joining JSONL events.
+      instanceTracker.recordReconnectSuccess(this.instance.name);
+
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
@@ -673,7 +795,15 @@ export class BaileysStartupService extends ChannelStartupService {
       maxMsgRetryCount: 4,
       fireInitQueries: true,
       connectTimeoutMs: 30_000,
-      keepAliveIntervalMs: 30_000,
+      // 20s per Baileys maintainer guidance (2026-05-04 thread, recorded in
+      // docs/zombie-instance-investigation.md → "Reconnect baseline").
+      // Lower keepAlive surfaces dead sockets faster: Baileys flags the
+      // connection lost after `keepAliveIntervalMs + 5s` of silence, so 20s
+      // means we get a connection.update {close} within ~25s of a network
+      // drop instead of waiting ~35s. Tightens the window where we are blind
+      // (WS dead but service still thinks open) before the reconnect classifier
+      // runs.
+      keepAliveIntervalMs: 20_000,
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
@@ -715,7 +845,79 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    // 2026-05-06 v4: detach the previous client's event-emitter and ws
+    // listeners BEFORE we replace this.client. Without this, every reinit
+    // accumulates a fresh set of `client.ev.process(...)` callbacks plus
+    // wsRef.on('open'|'close'|'error'|'message') listeners on the OLD ws.
+    // The 5h zombie incident saw 27 reinits — that's potentially 27
+    // zombie clients all racing through the shared eventProcessingQueue,
+    // and the new client's events queued behind whatever the old ones
+    // had stuck. client.end() does NOT do this — it only closes the
+    // socket. We do it explicitly here.
+    //
+    // Wrapped in try/catch per call: removeAllListeners on a half-dead
+    // ws can throw on some Baileys versions if the underlying TLS
+    // socket is in an inconsistent state.
+    // 2026-05-06 v4.1: snapshot the OLD client's listener counts BEFORE
+    // we tear it down. After cleanup these can't be read (listeners are
+    // gone). Passed into incrementClientGen so client.gen.advance carries
+    // the previous gen's listener census — the direct fingerprint of a
+    // pre-existing leak.
+    const previousGenWsListenerCount = this.client ? readEventListenerCounts(this.client.ws) : null;
+    const previousGenEvListenerCount = this.client ? { ...this.evListenerBookkeeping } : null;
+
+    if (this.client) {
+      // 2026-05-06 v4.1: idiomatic detach via the unsubscribe returned by
+      // Baileys' process() call. This is the only documented way to
+      // detach a process() handler (client.ev.removeAllListeners forwards
+      // to the inner EE but is heavy-handed and might surprise other
+      // attachments). We do BOTH: explicit unsubscribe first, then the
+      // belt-and-braces removeAllListeners.
+      try {
+        this.evProcessUnsubscribe?.();
+        if (this.evListenerBookkeeping.event) {
+          this.evListenerBookkeeping.event -= 1;
+        }
+      } catch {
+        /* swallow — old client is being discarded anyway */
+      }
+      this.evProcessUnsubscribe = null;
+
+      try {
+        // `as any` because Baileys' typed wrapper has overloads requiring an
+        // event name; we want the no-arg form to detach all events at once.
+        // Forwards to the inner EE per event-buffer.js:146.
+        (this.client.ev as any)?.removeAllListeners?.();
+      } catch {
+        /* swallow — old client is being discarded anyway */
+      }
+      try {
+        (this.client.ws as any)?.removeAllListeners?.();
+      } catch {
+        /* same */
+      }
+    }
+    // Per-gen reset: any lingering bookkeeping is wiped because the new
+    // generation will re-register from a clean slate.
+    this.evListenerBookkeeping = {};
+    // Reset the per-service event-processing queue so the new client's
+    // events don't queue behind whatever the old client had pending.
+    // The old chain is left to settle on its own (its handlers are
+    // already detached via removeAllListeners above, so they won't
+    // fire — but anything mid-await still finishes harmlessly).
+    this.eventProcessingQueue = Promise.resolve();
+
     this.client = makeWASocket(socketConfig);
+
+    // 2026-05-06 v4: stamp the new generation so every forensic event
+    // for the rest of this createClient invocation can be tagged with
+    // it, and the snapshot's `clientGen` reflects the live socket.
+    const isFirstGen = instanceTracker.currentClientGen(this.instance.name) === 0;
+    const newGen = instanceTracker.incrementClientGen(this.instance.name, isFirstGen ? 'boot' : 'reinit', {
+      previousGenWsListenerCount,
+      previousGenEvListenerCount,
+      heapUsedMb: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+    });
 
     // ── Forensic: register instance + raw WS lifecycle hooks ──
     try {
@@ -731,22 +933,153 @@ export class BaileysStartupService extends ChannelStartupService {
           }
         },
         // Auto-heal hook: when the heartbeat decides the pipeline is
-        // stalled past the threshold, it calls this to force a fresh
-        // socket. We use `this.client.end(...)` rather than `ws.close()`
-        // because the former triggers Baileys' own reconnect path and
-        // tears down the processingMutex chain along with the socket.
+        // stalled past the threshold, it calls this to force a fresh socket.
+        //
+        // 2026-05-04 incident — 6h zombie loop, autoheal.fire 76× with no
+        // recovery: when the underlying WS is already half-dead (readyState
+        // null after a code-1006 abort), `client.end()` is a no-op — Baileys
+        // never emits another `connection.update {close}`, so the L1
+        // classifier never re-runs and `connectToWhatsapp()` is never called.
+        //
+        // Fix: snapshot the pre-state, tear the socket down ourselves, then
+        // call `connectToWhatsapp()` directly instead of trusting Baileys to
+        // emit the event. Forensic events bracket the operation so the next
+        // incident has a complete timeline (start, ws state observed, end()
+        // outcome, reconnect outcome, durations).
         (reason: string) => {
+          const startTs = Date.now();
+          const wsBefore = (() => {
+            try {
+              const ws: any = this.client?.ws;
+              return typeof ws?.readyState === 'number' ? ws.readyState : null;
+            } catch {
+              return null;
+            }
+          })();
+          // 2026-05-06 v4: capture listener-leak signature in autoheal events.
+          // If `evListenerCountBefore` keeps climbing across reinits, we have
+          // a leak (createClient v4 fix should keep these flat: connection.update
+          // = 1, messages.upsert = 1, etc.).
+          const evCountBefore = readEventListenerCounts(this.client?.ev);
+          const wsCountBefore = readEventListenerCounts(this.client?.ws);
+          const genBefore = instanceTracker.currentClientGen(this.instance.name);
+          this.logger.warn(`[autoheal] forcing reconnect: ${reason} (wsReadyState=${wsBefore})`);
+          forensic({
+            kind: 'autoheal.forceclose.start',
+            instance: this.instance.name,
+            reason,
+            wsReadyStateBefore: wsBefore,
+            clientGen: genBefore,
+            evListenerCountBefore: evCountBefore,
+            wsListenerCountBefore: wsCountBefore,
+            // Tell us whether this teardown is a no-op (nothing to close)
+            // — `wsReadyState: null` plus 1ms duration means the previous
+            // socket was already gone. Distinguishes "we ended a live ws"
+            // from "the ws was a phantom".
+            noopTeardown: wsBefore === null,
+          }).catch(() => {});
+
+          let endError: string | null = null;
+          let wsCloseError: string | null = null;
           try {
-            this.logger.warn(`[autoheal] forcing reconnect: ${reason}`);
+            this.client?.ws?.close?.();
+          } catch (err: any) {
+            wsCloseError = err?.message ?? String(err);
+          }
+          try {
             this.client?.end?.(new Error(`autoheal:${reason}`));
           } catch (err: any) {
-            this.logger.error(`[autoheal] forceClose failed: ${err?.message}`);
+            endError = err?.message ?? String(err);
           }
+
+          // Drop the reference so any stale closures don't keep the dead
+          // socket alive. createClient() will reassign `this.client` on the
+          // next call.
+          const teardownDurationMs = Date.now() - startTs;
+          forensic({
+            kind: 'autoheal.forceclose.teardown',
+            instance: this.instance.name,
+            reason,
+            wsCloseError,
+            endError,
+            teardownDurationMs,
+            clientGen: genBefore,
+          }).catch(() => {});
+
+          // Re-init directly. We can't trust Baileys' connection.update path
+          // anymore — that's the whole reason we're in autoheal. The classifier
+          // and L1 reconnect path stay in place for *normal* close events;
+          // this is the recovery for the case where they never fire.
+          this.connectToWhatsapp(this.phoneNumber)
+            .then(() => {
+              const genAfter = instanceTracker.currentClientGen(this.instance.name);
+              const evCountAfter = readEventListenerCounts(this.client?.ev);
+              const wsCountAfter = readEventListenerCounts(this.client?.ws);
+              forensic({
+                kind: 'autoheal.reinit.success',
+                instance: this.instance.name,
+                reason,
+                totalDurationMs: Date.now() - startTs,
+                clientGenBefore: genBefore,
+                clientGenAfter: genAfter,
+                evListenerCountAfter: evCountAfter,
+                wsListenerCountAfter: wsCountAfter,
+              }).catch(() => {});
+              this.logger.info(`[autoheal] reinit ok: ${reason} (${Date.now() - startTs}ms)`);
+              // Schedule the zombie-rebirth probe — checks at +30s whether
+              // the new generation actually saw connection.update {open}.
+              // If not, that's the v4-fingerprint of a stillborn socket
+              // and should be the signal to escalate (process restart,
+              // operator alert, or recreate-instance). Default 30s is
+              // enough time for the noise handshake to complete on a
+              // healthy reconnect.
+              instanceTracker.scheduleReinitProbe(
+                this.instance.name,
+                Number(process.env.FORENSIC_AUTOHEAL_PROBE_MS) || 30_000,
+              );
+            })
+            .catch((err: any) => {
+              forensic({
+                kind: 'autoheal.reinit.failed',
+                instance: this.instance.name,
+                reason,
+                totalDurationMs: Date.now() - startTs,
+                clientGenBefore: genBefore,
+                error: {
+                  message: err?.message ?? String(err),
+                  name: err?.name,
+                  stack: err?.stack?.split('\n').slice(0, 6).join('\n'),
+                },
+              }).catch(() => {});
+              this.logger.error(`[autoheal] reinit FAILED: ${reason} → ${err?.message ?? err}`);
+            });
+        },
+        // 2026-05-06 v4: live listener counters. The tracker reads these
+        // every snapshot, so the heartbeat shows whether ev/ws listeners
+        // are growing across clientGens — the direct fingerprint of a
+        // listener leak. Bound to `this` so they always read the *current*
+        // client even after reinits.
+        //
+        // ev: read our manual bookkeeping. The standard EventEmitter
+        // introspection returns 0 because client.ev is the buffered
+        // wrapper, not the raw EE underneath (see event-buffer.js).
+        //   { event: 1 } = healthy single process() registration
+        //   { event: 2+ } = leak — the v4 fix didn't catch a previous
+        //                   gen's listener
+        // ws: read directly from the WS (real EventEmitter, populates fine).
+        {
+          ev: () => ({ ...this.evListenerBookkeeping, __total: this.totalEvListeners() }),
+          ws: () => readEventListenerCounts(this.client?.ws),
         },
       );
       if (wsRef?.on) {
+        // 2026-05-06 v4: capture the gen at listener-attach time. Used
+        // to attribute ws.message frames to the gen whose ws emitted
+        // them, even if `wsRef` is later replaced and the closure
+        // would otherwise look like the latest gen.
+        const attachedGen = newGen;
         wsRef.on('open', () => {
-          instanceTracker.recordActivity(this.instance.name, 'ws.open');
+          instanceTracker.recordActivity(this.instance.name, 'ws.open', { clientGen: attachedGen });
         });
         wsRef.on('close', (code: number, reasonBuf: Buffer) => {
           let reason: string | null = null;
@@ -755,17 +1088,23 @@ export class BaileysStartupService extends ChannelStartupService {
           } catch {
             /* noop */
           }
-          instanceTracker.recordActivity(this.instance.name, 'ws.close', { code, reason });
+          instanceTracker.recordActivity(this.instance.name, 'ws.close', {
+            code,
+            reason,
+            clientGen: attachedGen,
+          });
         });
         wsRef.on('error', (err: Error) => {
           instanceTracker.recordActivity(this.instance.name, 'ws.error', {
             message: err?.message,
             name: err?.name,
             stack: err?.stack?.split('\n').slice(0, 6).join('\n'),
+            clientGen: attachedGen,
           });
         });
         wsRef.on('message', () => {
           // High-volume; do NOT log per-message. Just bump activity timestamp.
+          // (clientGen on every ws.message would balloon the JSONL.)
           instanceTracker.recordActivity(this.instance.name, 'ws.message');
         });
       }
@@ -1899,6 +2238,31 @@ export class BaileysStartupService extends ChannelStartupService {
         this.sendDataWebhook(Events.GROUP_PARTICIPANTS_UPDATE, participantsUpdate);
       }
 
+      // [GDW-008] Best-effort persistence (env-gated, swallow errors).
+      // One row per affected participant — keeps the schema queryable by
+      // affectedJid even when an admin adds/removes multiple users at once.
+      try {
+        const participants = participantsUpdate.participants ?? [];
+        const baseRow = {
+          instanceId: this.instanceId,
+          groupJid: participantsUpdate.id,
+          eventType: 'participant_update',
+          action: participantsUpdate.action,
+          actorJid: participantsUpdate.author ?? null,
+          actorPn: participantsUpdate.authorPn ?? null,
+          payload: participantsUpdate as unknown,
+        };
+        if (participants.length <= 1) {
+          this.groupEventPersistence.record({ ...baseRow, affectedJid: participants[0] ?? null }).catch(() => {});
+        } else {
+          for (const affectedJid of participants) {
+            this.groupEventPersistence.record({ ...baseRow, affectedJid }).catch(() => {});
+          }
+        }
+      } catch {
+        /* persistence must never break webhook fan-out */
+      }
+
       this.updateGroupMetadataCache(participantsUpdate.id);
     },
 
@@ -1911,11 +2275,29 @@ export class BaileysStartupService extends ChannelStartupService {
     'group.join-request': async (joinRequest: {
       id: string;
       author?: string;
+      authorPn?: string;
       participant: string;
+      participantPn?: string;
       action: 'created' | 'revoked' | 'rejected';
       method?: 'invite_link' | 'non_admin_add' | string;
     }) => {
       this.sendDataWebhook(Events.GROUP_JOIN_REQUEST, joinRequest);
+
+      // [GDW-008] Best-effort persistence (env-gated, swallow errors).
+      this.groupEventPersistence
+        .record({
+          instanceId: this.instanceId,
+          groupJid: joinRequest.id,
+          eventType: 'join_request',
+          action: joinRequest.action,
+          method: joinRequest.method ?? null,
+          actorJid: joinRequest.author ?? null,
+          actorPn: joinRequest.authorPn ?? null,
+          affectedJid: joinRequest.participant ?? null,
+          affectedPn: joinRequest.participantPn ?? null,
+          payload: joinRequest as unknown,
+        })
+        .catch(() => {});
     },
   };
 
@@ -1998,7 +2380,15 @@ export class BaileysStartupService extends ChannelStartupService {
         });
       });
     };
-    this.client.ev.process(async (events) => {
+    // 2026-05-06 v4.1: capture the unsubscribe returned by Baileys'
+    // process(). The next createClient() will call it from the v4 cleanup
+    // block, which detaches the listener idiomatically (the wrapper's
+    // public API). Also bump our manual listener bookkeeping so the
+    // forensic snapshot can show "how many handlers are wired to this
+    // gen's ev wrapper" — the standard EventEmitter introspection
+    // returns 0 because client.ev is the buffered wrapper, not the raw
+    // EE underneath.
+    this.evProcessUnsubscribe = this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue
         .then(async () => {
           try {
@@ -2172,6 +2562,11 @@ export class BaileysStartupService extends ChannelStartupService {
           });
         });
     });
+    // Manual bookkeeping: process() adds exactly one listener on the
+    // 'event' channel of the inner EE. If this number ever exceeds 1
+    // mid-gen, two handlers fight for the same events — the leak
+    // signature.
+    this.evListenerBookkeeping.event = (this.evListenerBookkeeping.event ?? 0) + 1;
   }
 
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
@@ -4598,6 +4993,19 @@ export class BaileysStartupService extends ChannelStartupService {
         isCommunity: group.isCommunity,
         isCommunityAnnounce: group.isCommunityAnnounce,
         linkedParent: group.linkedParent,
+        // [GDW-005] surface fields Baileys provides but upstream Evolution drops
+        addressingMode: group.addressingMode,
+        ownerPn: group.ownerPn,
+        owner_country_code: group.owner_country_code,
+        subjectOwnerPn: group.subjectOwnerPn,
+        descOwner: group.descOwner,
+        descOwnerPn: group.descOwnerPn,
+        descTime: group.descTime,
+        memberAddMode: group.memberAddMode,
+        joinApprovalMode: group.joinApprovalMode,
+        ephemeralDuration: group.ephemeralDuration,
+        author: group.author,
+        authorPn: group.authorPn,
       };
     } catch (error) {
       if (reply === 'inner') {
@@ -4712,6 +5120,9 @@ export class BaileysStartupService extends ChannelStartupService {
           ...participant,
           name: participant.name ?? contact?.pushName,
           imgUrl: participant.imgUrl ?? contact?.profilePicUrl,
+          // [GDW-005] surface phoneNumber + lid (Baileys Contact fields) explicitly
+          phoneNumber: participant.phoneNumber,
+          lid: participant.lid,
         };
       });
 
@@ -5280,5 +5691,270 @@ export class BaileysStartupService extends ChannelStartupService {
         records: formattedMessages,
       },
     };
+  }
+
+  // ─── [GDW-004] Join-request actions ────────────────────────────────────
+  // Six standard group RPCs Baileys exposes that upstream Evolution does
+  // not wrap. Closes the loop with GDW-002 (join-request capture) so an
+  // admin UI can list pending requests and approve/reject via REST.
+  // Mutating ops invalidate `groupMetadataCache` for the affected JID.
+
+  public async groupAcceptInviteV4(data: GroupAcceptInviteV4Dto) {
+    try {
+      // baileys returns the resolved groupJid (string) on success.
+      const groupJid = await this.client.groupAcceptInviteV4(data.key as any, data.inviteMessage as any);
+      // Resolved JID may differ from anything we know; invalidate defensively if string.
+      if (typeof groupJid === 'string') {
+        await groupMetadataCache.delete(groupJid);
+      }
+      return { accepted: true, groupJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Accept group invite V4 error', error?.toString());
+    }
+  }
+
+  public async groupRevokeInviteV4(data: GroupRevokeInviteV4Dto) {
+    try {
+      const ok = await this.client.groupRevokeInviteV4(data.groupJid, data.invitedJid);
+      await groupMetadataCache.delete(data.groupJid);
+      return { revoked: ok, groupJid: data.groupJid, invitedJid: data.invitedJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Revoke group invite V4 error', error?.toString());
+    }
+  }
+
+  public async groupMemberAddMode(data: GroupMemberAddModeDto) {
+    try {
+      await this.client.groupMemberAddMode(data.groupJid, data.mode);
+      await groupMetadataCache.delete(data.groupJid);
+      return { groupJid: data.groupJid, mode: data.mode, updated: true };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error updating member add mode', error?.toString());
+    }
+  }
+
+  public async groupJoinApprovalMode(data: GroupJoinApprovalModeDto) {
+    try {
+      await this.client.groupJoinApprovalMode(data.groupJid, data.mode);
+      await groupMetadataCache.delete(data.groupJid);
+      return { groupJid: data.groupJid, mode: data.mode, updated: true };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error updating join approval mode', error?.toString());
+    }
+  }
+
+  public async groupRequestParticipantsList(id: GroupJid) {
+    try {
+      const pending = await this.client.groupRequestParticipantsList(id.groupJid);
+      return { groupJid: id.groupJid, pendingRequests: pending };
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Error fetching pending join requests', error?.toString());
+    }
+  }
+
+  public async groupRequestParticipantsUpdate(data: GroupUpdatePendingRequestsDto) {
+    try {
+      const result = await this.client.groupRequestParticipantsUpdate(data.groupJid, data.participants, data.action);
+      await groupMetadataCache.delete(data.groupJid);
+      return { groupJid: data.groupJid, action: data.action, result };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error updating pending join requests', error?.toString());
+    }
+  }
+
+  // ─── [GDW-007] Communities ─────────────────────────────────────────────
+  // Thin wrappers around baileys' communities.* surface. We return whatever
+  // baileys returns (raw) — no Prisma persistence in this patch. Methods that
+  // mutate group/community membership invalidate the in-memory metadata cache.
+
+  public async communityMetadata(data: CommunityJid) {
+    try {
+      return await this.client.communityMetadata(data.communityJid);
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Community metadata not found', error?.toString());
+    }
+  }
+
+  public async communityCreate(data: CommunityCreateDto) {
+    try {
+      return await this.client.communityCreate(data.subject, data.body);
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException('Error creating community', error?.toString());
+    }
+  }
+
+  public async communityCreateGroup(data: CommunityCreateGroupDto) {
+    try {
+      const participants = (await this.whatsappNumber({ numbers: data.participants }))
+        .filter((p) => p.exists)
+        .map((p) => p.jid);
+      const meta = await this.client.communityCreateGroup(data.subject, participants, data.parentCommunityJid);
+      // New child group changes the community linkage; drop cached parent meta.
+      await groupMetadataCache.delete(data.parentCommunityJid);
+      return meta;
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException('Error creating community group', error?.toString());
+    }
+  }
+
+  public async communityLeave(data: CommunityJid) {
+    try {
+      await this.client.communityLeave(data.communityJid);
+      await groupMetadataCache.delete(data.communityJid);
+      return { communityJid: data.communityJid, leave: true };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Unable to leave the community', error?.toString());
+    }
+  }
+
+  public async communityUpdateSubject(data: CommunitySubjectDto) {
+    try {
+      await this.client.communityUpdateSubject(data.communityJid, data.subject);
+      await groupMetadataCache.delete(data.communityJid);
+      return { update: 'success' };
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException('Error updating community subject', error?.toString());
+    }
+  }
+
+  public async communityUpdateDescription(data: CommunityDescriptionDto) {
+    try {
+      await this.client.communityUpdateDescription(data.communityJid, data.description);
+      await groupMetadataCache.delete(data.communityJid);
+      return { update: 'success' };
+    } catch (error) {
+      this.logger.error(error);
+      throw new InternalServerErrorException('Error updating community description', error?.toString());
+    }
+  }
+
+  public async communityLinkGroup(data: CommunityLinkGroupDto) {
+    try {
+      await this.client.communityLinkGroup(data.groupJid, data.parentCommunityJid);
+      await groupMetadataCache.delete(data.groupJid);
+      await groupMetadataCache.delete(data.parentCommunityJid);
+      return { linked: true, groupJid: data.groupJid, parentCommunityJid: data.parentCommunityJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error linking group to community', error?.toString());
+    }
+  }
+
+  public async communityUnlinkGroup(data: CommunityLinkGroupDto) {
+    try {
+      await this.client.communityUnlinkGroup(data.groupJid, data.parentCommunityJid);
+      await groupMetadataCache.delete(data.groupJid);
+      await groupMetadataCache.delete(data.parentCommunityJid);
+      return { unlinked: true, groupJid: data.groupJid, parentCommunityJid: data.parentCommunityJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error unlinking group from community', error?.toString());
+    }
+  }
+
+  public async communityFetchLinkedGroups(data: CommunityJid) {
+    try {
+      return await this.client.communityFetchLinkedGroups(data.communityJid);
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Error fetching linked groups', error?.toString());
+    }
+  }
+
+  public async communityInviteCode(data: CommunityJid) {
+    try {
+      const code = await this.client.communityInviteCode(data.communityJid);
+      return { inviteUrl: code ? `https://chat.whatsapp.com/${code}` : null, inviteCode: code };
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('No community invite code', error?.toString());
+    }
+  }
+
+  public async communityRevokeInvite(data: CommunityJid) {
+    try {
+      const inviteCode = await this.client.communityRevokeInvite(data.communityJid);
+      return { revoked: true, inviteCode };
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Revoke community invite error', error?.toString());
+    }
+  }
+
+  public async communityAcceptInvite(data: CommunityInviteCode) {
+    try {
+      const communityJid = await this.client.communityAcceptInvite(data.inviteCode);
+      return { accepted: true, communityJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Accept community invite error', error?.toString());
+    }
+  }
+
+  public async communityAcceptInviteV4(data: CommunityAcceptInviteV4Dto) {
+    try {
+      return await this.client.communityAcceptInviteV4(data.key as any, data.inviteMessage as any);
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Accept community invite V4 error', error?.toString());
+    }
+  }
+
+  public async communityRevokeInviteV4(data: CommunityRevokeInviteV4Dto) {
+    try {
+      const ok = await this.client.communityRevokeInviteV4(data.communityJid, data.invitedJid);
+      return { revoked: ok, communityJid: data.communityJid, invitedJid: data.invitedJid };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Revoke community invite V4 error', error?.toString());
+    }
+  }
+
+  public async communityRequestParticipantsList(data: CommunityJid) {
+    try {
+      const pending = await this.client.communityRequestParticipantsList(data.communityJid);
+      return { communityJid: data.communityJid, pendingRequests: pending };
+    } catch (error) {
+      this.logger.error(error);
+      throw new NotFoundException('Error fetching pending requests', error?.toString());
+    }
+  }
+
+  public async communityRequestParticipantsUpdate(data: CommunityUpdatePendingRequestsDto) {
+    try {
+      const result = await this.client.communityRequestParticipantsUpdate(
+        data.communityJid,
+        data.participants,
+        data.action,
+      );
+      await groupMetadataCache.delete(data.communityJid);
+      return { communityJid: data.communityJid, action: data.action, result };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error updating pending requests', error?.toString());
+    }
+  }
+
+  public async communityParticipantsUpdate(data: CommunityUpdateParticipantsDto) {
+    try {
+      const participants = data.participants.map((p) => createJid(p));
+      const result = await this.client.communityParticipantsUpdate(data.communityJid, participants, data.action);
+      await groupMetadataCache.delete(data.communityJid);
+      return { updateParticipants: result };
+    } catch (error) {
+      this.logger.error(error);
+      throw new BadRequestException('Error updating community participants', error?.toString());
+    }
   }
 }

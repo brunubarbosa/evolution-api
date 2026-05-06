@@ -1,4 +1,5 @@
 import { forensic, forensicSync, subscribeForensic, writeSnapshot } from './forensic-logger';
+import { inFlightSnapshot } from './in-flight';
 
 export type ActivityKind =
   | 'connection.update'
@@ -60,6 +61,13 @@ interface InstanceState {
   stalledSinceMs: number | null;
   lastAutoHealAt: number | null;
   autoHealCount: number;
+  // 2026-05-04: streak of autoheal fires since the last successful reconnect.
+  // Resets on `reconnect.success`. Used to detect "we're firing forever and
+  // recovering nothing" — when this passes AUTO_HEAL_GIVEUP_AFTER we emit
+  // `autoheal.giveup` once so monitoring can surface "auth state likely toast,
+  // operator re-pair needed."
+  autoHealStreak: number;
+  autoHealGiveupEmitted: boolean;
   // 2026-05-01 v3.1: sliding-window error counters surfaced in every snapshot
   // so we can spot "is this happening continuously?" without grepping JSONL.
   // Per-instance for handler/auth-state errors; process-wide signals (mutex,
@@ -73,6 +81,61 @@ interface InstanceState {
   // pulse that fires {connection: null} dozens of times per second and
   // floods the JSONL with empty event lines that hide real transitions.
   lastConnectionUpdateSig: string | null;
+  // 2026-05-04: reconnect lifecycle. Tracked so the snapshot can answer
+  // "is this instance flapping?" without parsing JSONL. Each entry records
+  // a single decided reconnect (or terminal). `recentReconnects` is a sliding
+  // ring of timestamps used by the flapping guard.
+  reconnectAttempts: number;
+  lastReconnectAt: number | null;
+  reconnectHistory: ReconnectHistoryEntry[];
+  recentReconnectTimestamps: number[];
+
+  // 2026-05-06 v4: client generation counter. Increments every time
+  // BaileysStartupService.createClient() runs (initial boot + every reinit).
+  // Surfaces in snapshots so cross-referencing "what happened to client #5
+  // before client #6 was born" is possible from JSONL alone. Without this,
+  // the 5h zombie incident was hard to interpret because 27 reinits looked
+  // identical from the outside.
+  clientGen: number;
+  // Wall-clock at the last createClient() call.
+  clientGenStartedAt: number | null;
+  // Whether we observed a connection.update {open} on the current generation.
+  // Reset by incrementClientGen, set true by recordReconnectSuccess /
+  // recordActivity('connection.update', {connection:'open'}).
+  currentGenOpened: boolean;
+  // Per-generation count of connection.update {open} events. The 5h zombie
+  // had 27 reinits, 31 ws.opens, but currentGenOpenedCount stayed at 1
+  // (last good gen). This counter makes that pathology obvious.
+  currentGenOpenedAt: number | null;
+
+  // Live Baileys event-emitter listener counts, populated by an optional
+  // getter the service registers alongside wsReadyState. Captures the
+  // listener-leak signature directly: if these grow monotonically with
+  // clientGen, old client.ev listeners aren't being detached on reinit.
+  evListenerCount?: () => Record<string, number> | null;
+  wsListenerCount?: () => Record<string, number> | null;
+
+  // 2026-05-06 v4: post-reinit zombie-rebirth signal. Set when an autoheal
+  // reinit completes but the new socket fails to emit connection.update {open}
+  // within the probe window. Surfaces "the heal succeeded but the socket
+  // is born dead" — the exact pattern of the 5h zombie.
+  lastReinitZombieRebirthAt: number | null;
+  reinitZombieRebirthCount: number;
+
+  // Last fetch.error/fetch.terminated event captured per-instance — wired
+  // through global-fetch-instrument when the URL was identifiable. Helps
+  // attribute undici "terminated" cascades to the specific media or
+  // webhook URL that triggered them.
+  lastFetchError: { ts: number; url: string; host: string; message: string } | null;
+}
+
+export interface ReconnectHistoryEntry {
+  ts: number;
+  decision: 'reconnect' | 'terminal' | 'flapping-stopped';
+  reason: string;
+  statusCode: number | null;
+  attempt: number;
+  delayMs: number | null;
 }
 
 interface BucketCounter {
@@ -128,9 +191,34 @@ const RING_SIZE = Number(process.env.FORENSIC_RING_SIZE) || 200;
 // (and a fresh `processingMutex`). Disabled by default; enable by setting
 // FORENSIC_AUTO_HEAL=true. After firing, we cool down for at least the
 // same window before firing again on the same instance.
+// 📘 Threshold rationale + incident history: reconnect-runbook.md
+// (in grupodewhatsapp/docs/evolution-fork/). Don't tune any of these without
+// reading the "why these specific numbers" table.
 const AUTO_HEAL_ENABLED = String(process.env.FORENSIC_AUTO_HEAL || '').toLowerCase() === 'true';
 const AUTO_HEAL_AFTER_MS = Number(process.env.FORENSIC_AUTO_HEAL_AFTER_MS) || 3 * 60_000;
 const AUTO_HEAL_COOLDOWN_MS = Number(process.env.FORENSIC_AUTO_HEAL_COOLDOWN_MS) || 5 * 60_000;
+// 2026-05-04: after this many consecutive autoheal fires with no successful
+// reconnect (zombie streak unbroken), emit `autoheal.giveup` once. The
+// runbook calls this case out as "auth state likely unrecoverable — operator
+// must re-pair." We don't *stop* trying (the reinit might still succeed) but
+// we surface the signal loud so monitoring can catch it.
+const AUTO_HEAL_GIVEUP_AFTER = Number(process.env.FORENSIC_AUTO_HEAL_GIVEUP_AFTER) || 6;
+
+// Reconnect fastpath: when ws.close fires but no connection.update {close}
+// follows within this window, the Baileys handler short-circuited (e.g. an
+// uncaughtException in undici took out the recovery path). The fastpath then
+// invokes forceClose() so the auto-heal route runs in seconds rather than
+// waiting the full ZOMBIE_GAP_MS / AUTO_HEAL_AFTER_MS for the heartbeat to
+// notice. Default tuned for "is the handler going to get there or not?" —
+// a healthy reconnect emits connection.update within 1-2s of ws.close.
+const RECONNECT_FASTPATH_ENABLED = String(process.env.FORENSIC_RECONNECT_FASTPATH ?? 'true').toLowerCase() === 'true';
+const RECONNECT_FASTPATH_AFTER_MS = Number(process.env.FORENSIC_RECONNECT_FASTPATH_AFTER_MS) || 5_000;
+
+// Flapping guard: above this many reconnects in the window, stop and surface
+// to the operator. The numbers here are intentionally conservative — a healthy
+// instance reconnects 1-3× per hour at most, so 10 in 5min is unambiguous flap.
+const FLAPPING_THRESHOLD = Number(process.env.FORENSIC_RECONNECT_FLAPPING_THRESHOLD) || 10;
+const FLAPPING_WINDOW_MS = Number(process.env.FORENSIC_RECONNECT_FLAPPING_WINDOW_MS) || 5 * 60_000;
 
 function emptyBucket(): BucketCounter {
   return { timestamps: [], lastError: null };
@@ -178,12 +266,18 @@ class InstanceTracker {
     channel: 'baileys' | 'cloud',
     wsReadyState?: () => number | null,
     forceClose?: (reason: string) => void,
+    listenerCounts?: {
+      ev?: () => Record<string, number> | null;
+      ws?: () => Record<string, number> | null;
+    },
   ) {
     const existing = this.map.get(name);
     if (existing) {
       existing.channel = channel;
       if (wsReadyState) existing.wsReadyState = wsReadyState;
       if (forceClose) existing.forceClose = forceClose;
+      if (listenerCounts?.ev) existing.evListenerCount = listenerCounts.ev;
+      if (listenerCounts?.ws) existing.wsListenerCount = listenerCounts.ws;
       return;
     }
     this.map.set(name, {
@@ -212,17 +306,139 @@ class InstanceTracker {
       dbStatus: null,
       wsReadyState,
       forceClose,
+      evListenerCount: listenerCounts?.ev,
+      wsListenerCount: listenerCounts?.ws,
       stalledSinceMs: null,
       lastAutoHealAt: null,
       autoHealCount: 0,
+      autoHealStreak: 0,
+      autoHealGiveupEmitted: false,
       mutexTimeouts: emptyBucket(),
       prismaTimeouts: emptyBucket(),
       fetchErrors: emptyBucket(),
       authStateTimeouts: emptyBucket(),
       lastConnectionUpdateSig: null,
+      reconnectAttempts: 0,
+      lastReconnectAt: null,
+      reconnectHistory: [],
+      recentReconnectTimestamps: [],
+      clientGen: 0,
+      clientGenStartedAt: null,
+      currentGenOpened: false,
+      currentGenOpenedAt: null,
+      lastReinitZombieRebirthAt: null,
+      reinitZombieRebirthCount: 0,
+      lastFetchError: null,
     });
     forensic({ kind: 'instance.register', instance: name, channel }).catch(() => {});
     this.pushRing({ kind: 'instance.register', instance: name });
+  }
+
+  // 2026-05-06 v4: increments clientGen and resets per-generation flags.
+  // Called by BaileysStartupService.createClient() right after makeWASocket().
+  // Returns the new generation number so the caller can stamp it on
+  // forensic events (e.g. autoheal.reinit.success { clientGen: N }).
+  //
+  // First-call ordering: the service calls this BEFORE the full `register()`
+  // call below (because the new gen needs to be stamped on the listener
+  // closures that `register` captures). On the very first invocation the
+  // instance map is empty, so we lazily create a minimal entry here. The
+  // subsequent register() call will just update getter slots.
+  incrementClientGen(
+    name: string,
+    source: 'boot' | 'reinit',
+    extra?: {
+      // 2026-05-06 v4.1: snapshot the OLD client's listener counts before
+      // the service tears it down. The register-time getters always read
+      // `this.client` on the service which by this point points at the
+      // *new* client, so we can't introspect the dead one anymore. The
+      // service captures these counts pre-cleanup and passes them in.
+      previousGenWsListenerCount?: Record<string, number> | null;
+      previousGenEvListenerCount?: Record<string, number> | null;
+      // Heap snapshot at gen-advance time. Diff against the previous
+      // gen's snapshot to detect listener-leak-induced memory growth.
+      heapUsedMb?: number;
+    },
+  ): number {
+    let s = this.map.get(name);
+    if (!s) {
+      this.register(name, 'baileys');
+      s = this.map.get(name);
+      if (!s) return 0;
+    }
+    const previous = s.clientGen;
+    s.clientGen = previous + 1;
+    s.clientGenStartedAt = Date.now();
+    s.currentGenOpened = false;
+    s.currentGenOpenedAt = null;
+    forensic({
+      kind: 'client.gen.advance',
+      instance: name,
+      previousGen: previous,
+      newGen: s.clientGen,
+      source,
+      previousGenLastBaileysEventKind: s.lastBaileysEventKind,
+      previousGenMsSinceLastBaileysEvent: s.lastBaileysEventAt ? Date.now() - s.lastBaileysEventAt : null,
+      previousGenWsListenerCount: extra?.previousGenWsListenerCount ?? null,
+      previousGenEvListenerCount: extra?.previousGenEvListenerCount ?? null,
+      heapUsedMbAtAdvance: extra?.heapUsedMb ?? null,
+    }).catch(() => {});
+    return s.clientGen;
+  }
+
+  // Returns the current clientGen for tagging forensic events emitted from
+  // the service. Returns 0 if the instance is unknown (won't crash callers).
+  currentClientGen(name: string): number {
+    return this.map.get(name)?.clientGen ?? 0;
+  }
+
+  // 2026-05-06 v4: post-reinit zombie-rebirth probe. Called by the autoheal
+  // path after reinit.success — schedules a check at probeMs to verify the
+  // new generation actually saw a connection.update {open}. If not, emits
+  // `autoheal.reinit.zombie-rebirth` and bumps the per-instance counter so
+  // the snapshot shows "this instance is heal-reinit-but-stillborn N times".
+  scheduleReinitProbe(name: string, probeMs: number): void {
+    const s = this.map.get(name);
+    if (!s) return;
+    const targetGen = s.clientGen;
+    const startedAt = s.clientGenStartedAt ?? Date.now();
+    setTimeout(() => {
+      const ref = this.map.get(name);
+      if (!ref) return;
+      // If a newer reinit fired in the meantime, this probe is stale —
+      // the next probe will cover the newer gen.
+      if (ref.clientGen !== targetGen) return;
+      if (ref.currentGenOpened) return; // Healthy: connection.update {open} arrived.
+      ref.lastReinitZombieRebirthAt = Date.now();
+      ref.reinitZombieRebirthCount += 1;
+      forensic({
+        kind: 'autoheal.reinit.zombie-rebirth',
+        instance: name,
+        clientGen: targetGen,
+        msSinceReinit: Date.now() - startedAt,
+        msSinceLastBaileysEvent: ref.lastBaileysEventAt ? Date.now() - ref.lastBaileysEventAt : null,
+        msSinceLastConnectionUpdate: ref.lastConnectionUpdateAt ? Date.now() - ref.lastConnectionUpdateAt : null,
+        msSinceLastWsMessage: ref.lastWsMessageAt ? Date.now() - ref.lastWsMessageAt : null,
+        lastConnectionUpdate: ref.lastConnectionUpdate,
+        lastWsError: ref.lastWsError,
+        wsReadyState: ref.wsReadyState?.() ?? null,
+        evListenerCount: this.safeReadCounts(ref.evListenerCount),
+        wsListenerCount: this.safeReadCounts(ref.wsListenerCount),
+        rebirthCount: ref.reinitZombieRebirthCount,
+        hint: 'new socket constructed but no connection.update{open} arrived; auth-state replay or noise-handshake silent rejection likely. Process restart probably required.',
+      }).catch(() => {});
+    }, probeMs).unref?.();
+  }
+
+  // Helper that calls a getter and shrugs if it throws (defensive — getters
+  // touch live socket internals and may race with teardown).
+  private safeReadCounts(getter?: () => Record<string, number> | null): Record<string, number> | null {
+    if (!getter) return null;
+    try {
+      return getter() ?? null;
+    } catch {
+      return null;
+    }
   }
 
   unregister(name: string) {
@@ -252,9 +468,53 @@ class InstanceTracker {
     if (kind === 'connection.update') {
       s.lastConnectionUpdateAt = now;
       s.lastConnectionUpdate = detail ?? null;
+      // 2026-05-06 v4: mark the current client generation as "opened" the
+      // first time we see {connection: 'open'}. The reinit probe checks
+      // this flag — if still false at probe time, we caught a zombie rebirth.
+      if (detail && (detail as any).connection === 'open' && !s.currentGenOpened) {
+        s.currentGenOpened = true;
+        s.currentGenOpenedAt = now;
+      }
     } else if (kind === 'ws.close') {
       s.lastWsCloseAt = now;
       s.lastWsClose = detail ?? null;
+      // Fastpath (layer 2 of 3 — see reconnect-runbook.md): schedule a check
+      // for "did the connection.update handler ever run?". If not, the Baileys
+      // reconnect path short-circuited (typically because undici threw a
+      // TypeError: terminated mid-flight) and we must poke forceClose
+      // ourselves. Logged either way so we can audit the gap.
+      if (RECONNECT_FASTPATH_ENABLED) {
+        const wsCloseTs = now;
+        const instName = name;
+        setTimeout(() => {
+          const ref = this.map.get(instName);
+          if (!ref) return;
+          // If a connection.update arrived after the ws.close, the normal
+          // handler is on the case — leave it alone.
+          if (ref.lastConnectionUpdateAt && ref.lastConnectionUpdateAt > wsCloseTs) return;
+          // dbStatus is set to 'close' by the service when the connection
+          // moves to terminal (e.g. logout/conflict path); in that case
+          // the operator has been notified and we don't auto-reconnect.
+          if (ref.dbStatus === 'close') return;
+          forensic({
+            kind: 'reconnect.fastpath',
+            instance: instName,
+            reason: 'ws-close-without-connection-update',
+            wsCloseAgeMs: Date.now() - wsCloseTs,
+          }).catch(() => {});
+          if (typeof ref.forceClose === 'function') {
+            try {
+              ref.forceClose('fastpath:ws-close-orphan');
+            } catch (err: any) {
+              forensic({
+                kind: 'reconnect.fastpath.error',
+                instance: instName,
+                error: err?.message,
+              }).catch(() => {});
+            }
+          }
+        }, RECONNECT_FASTPATH_AFTER_MS).unref?.();
+      }
     } else if (kind === 'ws.error') {
       s.lastWsErrorAt = now;
       s.lastWsError = detail ?? null;
@@ -311,10 +571,19 @@ class InstanceTracker {
     this.pushRing({ kind: 'prisma.timeout', detail: { model, op, message: message.slice(0, 200) } });
   }
 
-  recordFetchError(host: string, message?: string) {
-    // Fetch errors aren't naturally per-instance either; broadcast.
-    for (const s of this.map.values()) bumpBucket(s.fetchErrors, `${host}: ${message ?? ''}`);
-    this.pushRing({ kind: 'fetch.error', detail: { host, message } });
+  recordFetchError(host: string, message?: string, url?: string) {
+    // Fetch errors aren't naturally per-instance either; broadcast to all
+    // bucket counters. But also stash the URL on every instance's
+    // lastFetchError slot so the heartbeat snapshot shows WHICH URL broke,
+    // not just "you got fetch errors". Crucial for undici "terminated"
+    // cascades that point at Node internals only.
+    const now = Date.now();
+    const stash = url ? { ts: now, url, host, message: (message ?? '').slice(0, 300) } : null;
+    for (const s of this.map.values()) {
+      bumpBucket(s.fetchErrors, `${host}: ${message ?? ''}`);
+      if (stash) s.lastFetchError = stash;
+    }
+    this.pushRing({ kind: 'fetch.error', detail: { host, url, message } });
   }
 
   recordWebhookDelivery(
@@ -374,9 +643,160 @@ class InstanceTracker {
     this.pushRing({ kind: 'baileys.handler.error', instance: name ?? null, detail });
   }
 
+  // 2026-05-04: reconnect lifecycle hooks. The Baileys service calls these
+  // around its connection.update {close} branch so the snapshot can answer
+  // "is this instance reconnecting cleanly, or flapping?" at a glance —
+  // and so we can stop auto-reconnecting if it gets stuck in a loop.
+  //
+  // 📘 FULL CONTEXT: grupodewhatsapp/docs/evolution-fork/reconnect-runbook.md
+  // — explains the three layers (classifier / fastpath / auto-heal), the
+  // disconnect-code distribution we tuned against, and how to triage incidents.
+  //
+  // The tracker owns the attempt counter (and the backoff math), because the
+  // counter has to survive across instance recreations triggered by reconnect
+  // itself. Caller passes the per-error baseDelayMs and we return the final
+  // delayMs (with exponential backoff applied) plus whether to proceed.
+  recordReconnectDecision(
+    name: string,
+    decision: 'reconnect' | 'terminal',
+    detail: { reason: string; statusCode: number | null; baseDelayMs?: number },
+  ): { allowed: boolean; attempt: number; delayMs: number | null; flapping: boolean } {
+    const s = this.map.get(name);
+    const now = Date.now();
+    if (!s) {
+      return { allowed: decision === 'reconnect', attempt: 0, delayMs: null, flapping: false };
+    }
+
+    if (decision === 'terminal') {
+      s.reconnectHistory.push({
+        ts: now,
+        decision: 'terminal',
+        reason: detail.reason,
+        statusCode: detail.statusCode,
+        attempt: s.reconnectAttempts,
+        delayMs: null,
+      });
+      this.trimHistory(s);
+      forensic({
+        kind: 'reconnect.decision',
+        instance: name,
+        decision: 'terminal',
+        reason: detail.reason,
+        statusCode: detail.statusCode,
+      }).catch(() => {});
+      return { allowed: false, attempt: s.reconnectAttempts, delayMs: null, flapping: false };
+    }
+
+    // Prune timestamps older than the window before counting.
+    const windowStart = now - FLAPPING_WINDOW_MS;
+    s.recentReconnectTimestamps = s.recentReconnectTimestamps.filter((t) => t >= windowStart);
+    const flapping = s.recentReconnectTimestamps.length >= FLAPPING_THRESHOLD;
+
+    if (flapping) {
+      s.reconnectHistory.push({
+        ts: now,
+        decision: 'flapping-stopped',
+        reason: detail.reason,
+        statusCode: detail.statusCode,
+        attempt: s.reconnectAttempts,
+        delayMs: null,
+      });
+      this.trimHistory(s);
+      forensic({
+        kind: 'reconnect.flapping',
+        instance: name,
+        recentCount: s.recentReconnectTimestamps.length,
+        windowMs: FLAPPING_WINDOW_MS,
+        threshold: FLAPPING_THRESHOLD,
+        reason: detail.reason,
+        statusCode: detail.statusCode,
+      }).catch(() => {});
+      return { allowed: false, attempt: s.reconnectAttempts, delayMs: null, flapping: true };
+    }
+
+    s.reconnectAttempts += 1;
+    s.lastReconnectAt = now;
+    s.recentReconnectTimestamps.push(now);
+    // Exponential backoff over baseDelayMs, capped at 30s. The cap matters
+    // because the auto-heal layer kicks in around 180s — we should not push
+    // a single delay anywhere near that, otherwise we race auto-heal.
+    const base = detail.baseDelayMs ?? 0;
+    const delayMs = base === 0 ? 0 : Math.min(base * Math.pow(2, Math.max(0, s.reconnectAttempts - 1)), 30_000);
+    s.reconnectHistory.push({
+      ts: now,
+      decision: 'reconnect',
+      reason: detail.reason,
+      statusCode: detail.statusCode,
+      attempt: s.reconnectAttempts,
+      delayMs,
+    });
+    this.trimHistory(s);
+    forensic({
+      kind: 'reconnect.decision',
+      instance: name,
+      decision: 'reconnect',
+      reason: detail.reason,
+      statusCode: detail.statusCode,
+      attempt: s.reconnectAttempts,
+      delayMs,
+    }).catch(() => {});
+    return { allowed: true, attempt: s.reconnectAttempts, delayMs, flapping: false };
+  }
+
+  // Called when connection.update fires {connection: 'open'} after a reconnect
+  // attempt — clears the attempt counter so the next disconnect starts fresh
+  // backoff. Without this, every reconnect compounds the previous backoff.
+  recordReconnectSuccess(name: string): void {
+    const s = this.map.get(name);
+    if (!s) return;
+    // Reset autoheal streak whenever we observe a real reconnect, even if
+    // L1 didn't increment reconnectAttempts (e.g. autoheal-driven reinit).
+    const hadStreak = s.autoHealStreak > 0;
+    s.autoHealStreak = 0;
+    s.autoHealGiveupEmitted = false;
+    s.stalledSinceMs = null;
+    if (s.reconnectAttempts === 0 && !hadStreak) return;
+    forensic({
+      kind: 'reconnect.success',
+      instance: name,
+      attempts: s.reconnectAttempts,
+      autoHealStreakBeforeReset: hadStreak ? undefined : 0,
+      msSinceFirstAttempt: s.reconnectHistory.length ? Date.now() - s.reconnectHistory[0].ts : null,
+    }).catch(() => {});
+    s.reconnectAttempts = 0;
+  }
+
+  recordReconnectFailed(name: string, attempt: number, error?: string): void {
+    forensic({
+      kind: 'reconnect.failed',
+      instance: name,
+      attempt,
+      error: error?.slice(0, 300) ?? null,
+    }).catch(() => {});
+  }
+
+  // Bound so a long-lived instance's history doesn't grow unbounded. We keep
+  // the most recent 50 transitions which is plenty to spot a flap pattern.
+  private trimHistory(s: InstanceState): void {
+    if (s.reconnectHistory.length > 50) {
+      s.reconnectHistory.splice(0, s.reconnectHistory.length - 50);
+    }
+  }
+
   snapshot() {
     const now = Date.now();
     const mem = process.memoryUsage();
+    // 2026-05-06 v4: include in-flight summary in every snapshot. Pre-v4 this
+    // ran only on uncaughtException (via dumpInFlight in error.config.ts), so
+    // 9 leaked mutex tasks during the 5h zombie were invisible until we
+    // grepped for `baileys.mutex.timeout` lines.
+    const inflight = (() => {
+      try {
+        return inFlightSnapshot(10);
+      } catch {
+        return null;
+      }
+    })();
     return {
       ts: new Date(now).toISOString(),
       pid: process.pid,
@@ -388,6 +808,7 @@ class InstanceTracker {
         heapTotalMb: Math.round(mem.heapTotal / 1024 / 1024),
         externalMb: Math.round(mem.external / 1024 / 1024),
       },
+      inflight,
       instances: Array.from(this.map.values()).map((s) => {
         const wsRs = s.wsReadyState?.() ?? null;
         const msSinceActivity = s.lastActivityAt ? now - s.lastActivityAt : null;
@@ -438,10 +859,38 @@ class InstanceTracker {
           fetchErrors: bucketSummary(s.fetchErrors),
           authStateTimeouts: bucketSummary(s.authStateTimeouts),
           autoHealCount: s.autoHealCount,
+          autoHealStreak: s.autoHealStreak,
+          autoHealGiveupEmitted: s.autoHealGiveupEmitted,
           msSinceLastAutoHeal: s.lastAutoHealAt ? now - s.lastAutoHealAt : null,
           msSinceStalledStart: s.stalledSinceMs ? now - s.stalledSinceMs : null,
           zombieSuspected,
           stalledPipeline,
+          // 2026-05-04: reconnect lifecycle
+          reconnectAttempts: s.reconnectAttempts,
+          msSinceLastReconnect: s.lastReconnectAt ? now - s.lastReconnectAt : null,
+          // Tail of recent transitions — bounded to last 10 to keep snapshot
+          // payload small. Caller can fetch full history if needed.
+          recentReconnects: s.reconnectHistory.slice(-10),
+          // Sliding 5-min count for flap detection.
+          reconnectsInWindow: s.recentReconnectTimestamps.filter((t) => t >= now - FLAPPING_WINDOW_MS).length,
+          // 2026-05-06 v4: client generation + zombie-rebirth attribution.
+          // Cross-reference with autoheal.* events: 27 reinits with
+          // `currentGenOpened: false` = the exact 5h-zombie pattern.
+          clientGen: s.clientGen,
+          msSinceClientGen: s.clientGenStartedAt ? now - s.clientGenStartedAt : null,
+          currentGenOpened: s.currentGenOpened,
+          msSinceCurrentGenOpened: s.currentGenOpenedAt ? now - s.currentGenOpenedAt : null,
+          reinitZombieRebirthCount: s.reinitZombieRebirthCount,
+          msSinceLastReinitZombieRebirth: s.lastReinitZombieRebirthAt ? now - s.lastReinitZombieRebirthAt : null,
+          // Live listener counts. If these climb without bound across
+          // clientGens, we have an event-emitter leak (the v4 fix in
+          // BaileysStartupService.createClient should keep them flat).
+          evListenerCount: this.safeReadCounts(s.evListenerCount),
+          wsListenerCount: this.safeReadCounts(s.wsListenerCount),
+          // Last fetch error stashed by global-fetch-instrument (URL +
+          // host + message). Helps correlate undici "terminated" cascades
+          // with the specific media or webhook URL that broke.
+          lastFetchError: s.lastFetchError,
         };
       }),
       thresholds: {
@@ -449,7 +898,12 @@ class InstanceTracker {
         autoHealEnabled: AUTO_HEAL_ENABLED,
         autoHealAfterMs: AUTO_HEAL_AFTER_MS,
         autoHealCooldownMs: AUTO_HEAL_COOLDOWN_MS,
+        autoHealGiveupAfter: AUTO_HEAL_GIVEUP_AFTER,
         heartbeatMs: HEARTBEAT_MS,
+        reconnectFastpathEnabled: RECONNECT_FASTPATH_ENABLED,
+        reconnectFastpathAfterMs: RECONNECT_FASTPATH_AFTER_MS,
+        flappingThreshold: FLAPPING_THRESHOLD,
+        flappingWindowMs: FLAPPING_WINDOW_MS,
       },
       ringSize: this.ring.length,
     };
@@ -512,13 +966,28 @@ class InstanceTracker {
           const stalledForMs = now - state.stalledSinceMs;
           state.lastAutoHealAt = now;
           state.autoHealCount += 1;
+          state.autoHealStreak += 1;
           forensic({
             kind: 'autoheal.fire',
             instance: inst.name,
             stalledForMs,
             autoHealCount: state.autoHealCount,
+            autoHealStreak: state.autoHealStreak,
             reason: inst.stalledPipeline ? 'stalled-pipeline' : 'zombie-suspected',
           }).catch(() => {});
+          if (state.autoHealStreak >= AUTO_HEAL_GIVEUP_AFTER && !state.autoHealGiveupEmitted) {
+            state.autoHealGiveupEmitted = true;
+            forensic({
+              kind: 'autoheal.giveup',
+              instance: inst.name,
+              autoHealStreak: state.autoHealStreak,
+              giveupAfter: AUTO_HEAL_GIVEUP_AFTER,
+              stalledForMs,
+              hint: 'auth-state likely unrecoverable; operator re-pair (logout + QR) probably required',
+              lastWsClose: inst.lastWsClose,
+              lastConnectionUpdate: inst.lastConnectionUpdate,
+            }).catch(() => {});
+          }
           try {
             state.forceClose(`autoheal:${inst.stalledPipeline ? 'stalled' : 'zombie'}:${stalledForMs}ms`);
           } catch (err: any) {
@@ -571,6 +1040,7 @@ subscribeForensic((event) => {
       instanceTracker.recordFetchError(
         String((event as any).host ?? (event as any).url ?? '?'),
         String((event as any).message ?? (event as any).error?.message ?? ''),
+        (event as any).url ? String((event as any).url) : undefined,
       );
       break;
     case 'baileys.mutex.timeout':
