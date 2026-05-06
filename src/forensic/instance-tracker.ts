@@ -68,6 +68,18 @@ interface InstanceState {
   // operator re-pair needed."
   autoHealStreak: number;
   autoHealGiveupEmitted: boolean;
+  // 2026-05-06 v5: hard-stop the autoheal loop after this many consecutive
+  // zombie-rebirths (NOT just autoheal fires — those are normal during a
+  // legitimate stall). A rebirth means we constructed a fresh socket and
+  // WhatsApp silently rejected it — the auth-invalidation pattern from the
+  // 5h zombie. Once permanently stopped, no further autoheal.fire events
+  // emit until either:
+  //   - recordReconnectSuccess() runs (operator re-paired, real open arrived)
+  //   - the process restarts
+  // Surfaces the "operator must re-pair" state without ambiguity.
+  consecutiveRebirthCount: number;
+  autoHealPermanentlyStopped: boolean;
+  autoHealPermanentStopAt: number | null;
   // 2026-05-01 v3.1: sliding-window error counters surfaced in every snapshot
   // so we can spot "is this happening continuously?" without grepping JSONL.
   // Per-instance for handler/auth-state errors; process-wide signals (mutex,
@@ -203,6 +215,15 @@ const AUTO_HEAL_COOLDOWN_MS = Number(process.env.FORENSIC_AUTO_HEAL_COOLDOWN_MS)
 // must re-pair." We don't *stop* trying (the reinit might still succeed) but
 // we surface the signal loud so monitoring can catch it.
 const AUTO_HEAL_GIVEUP_AFTER = Number(process.env.FORENSIC_AUTO_HEAL_GIVEUP_AFTER) || 6;
+// 2026-05-06 v5: stop the autoheal loop entirely after this many consecutive
+// post-reinit zombie-rebirths. A rebirth = fresh socket constructed but no
+// connection.update {open} arrived — the WhatsApp-side auth-rejection
+// signature. Continuing to autoheal under this condition only antagonizes
+// WA's anti-abuse defense further. Default 3 = "first rebirth could be
+// transient, second is suspicious, third = stop and require operator action".
+// Tighter than AUTO_HEAL_GIVEUP_AFTER (which counts fires, including normal
+// fires during a real stall recovery).
+const AUTO_HEAL_REBIRTH_STOP_AFTER = Number(process.env.FORENSIC_AUTO_HEAL_REBIRTH_STOP_AFTER) || 3;
 
 // Reconnect fastpath: when ws.close fires but no connection.update {close}
 // follows within this window, the Baileys handler short-circuited (e.g. an
@@ -313,6 +334,9 @@ class InstanceTracker {
       autoHealCount: 0,
       autoHealStreak: 0,
       autoHealGiveupEmitted: false,
+      consecutiveRebirthCount: 0,
+      autoHealPermanentlyStopped: false,
+      autoHealPermanentStopAt: null,
       mutexTimeouts: emptyBucket(),
       prismaTimeouts: emptyBucket(),
       fetchErrors: emptyBucket(),
@@ -433,6 +457,13 @@ class InstanceTracker {
       if (ref.currentGenOpened) return; // Healthy: connection.update {open} arrived.
       ref.lastReinitZombieRebirthAt = Date.now();
       ref.reinitZombieRebirthCount += 1;
+      // 2026-05-06 v5: track CONSECUTIVE rebirths. Resets on any healthy
+      // open (handled in recordActivity / recordReconnectSuccess). When
+      // this hits AUTO_HEAL_REBIRTH_STOP_AFTER, the autoheal loop stops
+      // permanently — continuing only antagonizes WhatsApp's anti-abuse.
+      ref.consecutiveRebirthCount += 1;
+      const willPermanentlyStop =
+        !ref.autoHealPermanentlyStopped && ref.consecutiveRebirthCount >= AUTO_HEAL_REBIRTH_STOP_AFTER;
       forensic({
         kind: 'autoheal.reinit.zombie-rebirth',
         instance: name,
@@ -447,8 +478,22 @@ class InstanceTracker {
         evListenerCount: this.safeReadCounts(ref.evListenerCount),
         wsListenerCount: this.safeReadCounts(ref.wsListenerCount),
         rebirthCount: ref.reinitZombieRebirthCount,
+        consecutiveRebirthCount: ref.consecutiveRebirthCount,
+        willPermanentlyStopAutoHeal: willPermanentlyStop,
         hint: 'new socket constructed but no connection.update{open} arrived; auth-state replay or noise-handshake silent rejection likely. Process restart probably required.',
       }).catch(() => {});
+      if (willPermanentlyStop) {
+        ref.autoHealPermanentlyStopped = true;
+        ref.autoHealPermanentStopAt = Date.now();
+        forensic({
+          kind: 'autoheal.permanent-stop',
+          instance: name,
+          consecutiveRebirthCount: ref.consecutiveRebirthCount,
+          threshold: AUTO_HEAL_REBIRTH_STOP_AFTER,
+          autoHealCount: ref.autoHealCount,
+          hint: 'auto-heal loop disabled — operator must re-pair (logout + QR scan) to restore service. Further reinits would only worsen the WhatsApp anti-abuse flag.',
+        }).catch(() => {});
+      }
     }, probeMs).unref?.();
   }
 
@@ -496,6 +541,22 @@ class InstanceTracker {
       if (detail && (detail as any).connection === 'open' && !s.currentGenOpened) {
         s.currentGenOpened = true;
         s.currentGenOpenedAt = now;
+        // 2026-05-06 v5: a healthy open clears the rebirth streak and (if
+        // an operator re-paired) lifts the permanent-stop. The next zombie
+        // pattern starts counting fresh.
+        if (s.consecutiveRebirthCount > 0 || s.autoHealPermanentlyStopped) {
+          const wasPermStopped = s.autoHealPermanentlyStopped;
+          s.consecutiveRebirthCount = 0;
+          s.autoHealPermanentlyStopped = false;
+          s.autoHealPermanentStopAt = null;
+          if (wasPermStopped) {
+            forensic({
+              kind: 'autoheal.permanent-stop.cleared',
+              instance: name,
+              hint: 'connection.update {open} arrived; autoheal re-armed. Likely operator re-paired.',
+            }).catch(() => {});
+          }
+        }
       }
     } else if (kind === 'ws.close') {
       s.lastWsCloseAt = now;
@@ -904,6 +965,12 @@ class InstanceTracker {
           msSinceCurrentGenOpened: s.currentGenOpenedAt ? now - s.currentGenOpenedAt : null,
           reinitZombieRebirthCount: s.reinitZombieRebirthCount,
           msSinceLastReinitZombieRebirth: s.lastReinitZombieRebirthAt ? now - s.lastReinitZombieRebirthAt : null,
+          // 2026-05-06 v5: rebirth streak + permanent-stop flag for autoheal.
+          // operatorReeairRequired is the at-a-glance ops signal.
+          consecutiveRebirthCount: s.consecutiveRebirthCount,
+          autoHealPermanentlyStopped: s.autoHealPermanentlyStopped,
+          msSinceAutoHealPermanentStop: s.autoHealPermanentStopAt ? now - s.autoHealPermanentStopAt : null,
+          operatorRepairRequired: s.autoHealPermanentlyStopped,
           // Live listener counts. If these climb without bound across
           // clientGens, we have an event-emitter leak (the v4 fix in
           // BaileysStartupService.createClient should keep them flat).
@@ -921,6 +988,7 @@ class InstanceTracker {
         autoHealAfterMs: AUTO_HEAL_AFTER_MS,
         autoHealCooldownMs: AUTO_HEAL_COOLDOWN_MS,
         autoHealGiveupAfter: AUTO_HEAL_GIVEUP_AFTER,
+        autoHealRebirthStopAfter: AUTO_HEAL_REBIRTH_STOP_AFTER,
         heartbeatMs: HEARTBEAT_MS,
         reconnectFastpathEnabled: RECONNECT_FASTPATH_ENABLED,
         reconnectFastpathAfterMs: RECONNECT_FASTPATH_AFTER_MS,
@@ -980,6 +1048,10 @@ class InstanceTracker {
         if (
           AUTO_HEAL_ENABLED &&
           isStalled &&
+          // 2026-05-06 v5: hard-stop when too many consecutive rebirths.
+          // No more reinits — those only worsen WhatsApp's anti-abuse flag.
+          // Reset path: a healthy connection.update {open} clears the flag.
+          !state.autoHealPermanentlyStopped &&
           state.stalledSinceMs !== null &&
           now - state.stalledSinceMs >= AUTO_HEAL_AFTER_MS &&
           (state.lastAutoHealAt === null || now - state.lastAutoHealAt >= AUTO_HEAL_COOLDOWN_MS) &&

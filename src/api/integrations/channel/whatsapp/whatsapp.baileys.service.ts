@@ -323,6 +323,16 @@ export class BaileysStartupService extends ChannelStartupService {
   private evProcessUnsubscribe: (() => void) | null = null;
   private evListenerBookkeeping: Record<string, number> = {};
 
+  // 2026-05-06 v5: when autoheal calls forceClose, Baileys also emits
+  // connection.update {close} which would normally trigger the L1 reconnect
+  // classifier → connectToWhatsapp(). Autoheal ALSO calls connectToWhatsapp()
+  // explicitly. Result: two reinits race, doubling the reconnect storm
+  // (and with it, WhatsApp's anti-abuse pressure). This flag suppresses
+  // L1 during the autoheal teardown window. Set before forceClose's
+  // client.end() call, cleared when the autoheal-driven connectToWhatsapp
+  // settles. The L1 close handler checks the flag and bails out if set.
+  private autoHealReinitInProgress = false;
+
   private totalEvListeners(): number {
     let total = 0;
     for (const k of Object.keys(this.evListenerBookkeeping)) {
@@ -533,6 +543,24 @@ export class BaileysStartupService extends ChannelStartupService {
       //       within 5s (undici-crash signature)
       //   L3: instance-tracker auto-heal force-closes after 180s zombie
       // Plus: flapping guard stops auto-reconnect after 10 attempts in 5min.
+
+      // 2026-05-06 v5: when autoheal called forceClose, Baileys emits
+      // connection.update {close} as a SIDE EFFECT of the teardown. L1
+      // would normally race autoheal's explicit connectToWhatsapp() with
+      // its own setTimeout-driven reconnect, doubling the storm and
+      // worsening WhatsApp's anti-abuse pressure. The flag is set by the
+      // autoheal closure and cleared in .finally(). Skip the entire L1
+      // path in that window — just record the close event for forensics.
+      if (this.autoHealReinitInProgress) {
+        forensic({
+          kind: 'reconnect.l1.skipped',
+          instance: this.instance.name,
+          reason: 'autoheal-in-progress',
+          statusCode: (lastDisconnect?.error as Boom | undefined)?.output?.statusCode ?? null,
+        }).catch(() => {});
+        return;
+      }
+
       const boomErr = lastDisconnect?.error as Boom | undefined;
       const statusCode = boomErr?.output?.statusCode;
       // Boom's `data` is where the WhatsApp `<conflict tag attrs/>` payload
@@ -979,6 +1007,13 @@ export class BaileysStartupService extends ChannelStartupService {
             noopTeardown: wsBefore === null,
           }).catch(() => {});
 
+          // 2026-05-06 v5: signal the L1 close handler to step aside.
+          // Otherwise the connection.update {close} that Baileys emits
+          // from this teardown triggers L1's reconnect classifier →
+          // a SECOND connectToWhatsapp() racing against ours below.
+          // The flag clears in .then/.catch when our reinit settles.
+          this.autoHealReinitInProgress = true;
+
           let endError: string | null = null;
           let wsCloseError: string | null = null;
           try {
@@ -1052,6 +1087,11 @@ export class BaileysStartupService extends ChannelStartupService {
                 },
               }).catch(() => {});
               this.logger.error(`[autoheal] reinit FAILED: ${reason} → ${err?.message ?? err}`);
+            })
+            .finally(() => {
+              // 2026-05-06 v5: re-arm L1 reconnect for future close events.
+              // Whatever happens (success/failure), we're done racing.
+              this.autoHealReinitInProgress = false;
             });
         },
         // 2026-05-06 v4: live listener counters. The tracker reads these
