@@ -416,6 +416,75 @@ class InstanceTracker {
     return this.map.get(name)?.clientGen ?? 0;
   }
 
+  // 2026-05-06 v5.1: simulate a zombie-rebirth event for testing the
+  // flapping-guard threshold without needing a live WS to fail. Bumps
+  // the rebirth counters exactly as the real probe path would, including
+  // the permanent-stop trip when threshold is reached. Returns the post-
+  // increment state so the test harness can assert.
+  simulateRebirthForDebug(name: string): {
+    consecutiveRebirthCount: number;
+    autoHealPermanentlyStopped: boolean;
+    triggeredPermanentStop: boolean;
+  } | null {
+    const ref = this.map.get(name);
+    if (!ref) return null;
+    ref.lastReinitZombieRebirthAt = Date.now();
+    ref.reinitZombieRebirthCount += 1;
+    ref.consecutiveRebirthCount += 1;
+    const willPermanentlyStop =
+      !ref.autoHealPermanentlyStopped && ref.consecutiveRebirthCount >= AUTO_HEAL_REBIRTH_STOP_AFTER;
+    forensic({
+      kind: 'autoheal.reinit.zombie-rebirth',
+      instance: name,
+      synthetic: true,
+      clientGen: ref.clientGen,
+      rebirthCount: ref.reinitZombieRebirthCount,
+      consecutiveRebirthCount: ref.consecutiveRebirthCount,
+      willPermanentlyStopAutoHeal: willPermanentlyStop,
+      hint: 'synthetic rebirth triggered via debug endpoint for testing the flapping-guard logic.',
+    }).catch(() => {});
+    let triggeredPermanentStop = false;
+    if (willPermanentlyStop) {
+      ref.autoHealPermanentlyStopped = true;
+      ref.autoHealPermanentStopAt = Date.now();
+      triggeredPermanentStop = true;
+      forensic({
+        kind: 'autoheal.permanent-stop',
+        instance: name,
+        synthetic: true,
+        consecutiveRebirthCount: ref.consecutiveRebirthCount,
+        threshold: AUTO_HEAL_REBIRTH_STOP_AFTER,
+        autoHealCount: ref.autoHealCount,
+      }).catch(() => {});
+    }
+    return {
+      consecutiveRebirthCount: ref.consecutiveRebirthCount,
+      autoHealPermanentlyStopped: ref.autoHealPermanentlyStopped,
+      triggeredPermanentStop,
+    };
+  }
+
+  // 2026-05-06 v5.1: clear the permanent-stop flag synthetically (without
+  // needing a real connection.update {open}). Used by tests to verify the
+  // flag clears so subsequent stalls fire autoheal again.
+  clearPermanentStopForDebug(name: string): boolean {
+    const ref = this.map.get(name);
+    if (!ref) return false;
+    if (!ref.autoHealPermanentlyStopped && ref.consecutiveRebirthCount === 0) {
+      return false;
+    }
+    ref.consecutiveRebirthCount = 0;
+    ref.autoHealPermanentlyStopped = false;
+    ref.autoHealPermanentStopAt = null;
+    forensic({
+      kind: 'autoheal.permanent-stop.cleared',
+      instance: name,
+      synthetic: true,
+      hint: 'cleared synthetically via debug endpoint.',
+    }).catch(() => {});
+    return true;
+  }
+
   // 2026-05-06 v4.2: invoke the registered forceClose hook for stress
   // testing. Wired through a debug endpoint (env-gated) so the listener-leak
   // test harness can deterministically trigger N consecutive reinits and

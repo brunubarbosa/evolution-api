@@ -231,6 +231,30 @@ router
       .status(triggered ? HttpStatus.OK : HttpStatus.NOT_FOUND)
       .json({ triggered, clientGenBefore, instance: name, reason });
   })
+  // 2026-05-06 v5.1: synthetic rebirth simulator. Bumps the rebirth
+  // counters as if the post-reinit probe had fired, so the v5
+  // flapping-guard can be exercised without needing a real WhatsApp
+  // session failure. Returns the post-bump state.
+  .post('/forensic/debug/simulate-rebirth/:instanceName', authGuard['apikey'], (req, res) => {
+    if (String(process.env.FORENSIC_DEBUG_ENDPOINTS ?? '').toLowerCase() !== 'true') {
+      return res.status(HttpStatus.NOT_FOUND).json({ error: 'debug endpoints disabled' });
+    }
+    const name = req.params.instanceName;
+    const result = instanceTracker.simulateRebirthForDebug(name);
+    if (!result) {
+      return res.status(HttpStatus.NOT_FOUND).json({ error: 'instance not found', instance: name });
+    }
+    return res.status(HttpStatus.OK).json({ instance: name, ...result });
+  })
+  // 2026-05-06 v5.1: clear the permanent-stop synthetically.
+  .post('/forensic/debug/clear-permanent-stop/:instanceName', authGuard['apikey'], (req, res) => {
+    if (String(process.env.FORENSIC_DEBUG_ENDPOINTS ?? '').toLowerCase() !== 'true') {
+      return res.status(HttpStatus.NOT_FOUND).json({ error: 'debug endpoints disabled' });
+    }
+    const name = req.params.instanceName;
+    const cleared = instanceTracker.clearPermanentStopForDebug(name);
+    return res.status(HttpStatus.OK).json({ instance: name, cleared });
+  })
   .post('/verify-creds', authGuard['apikey'], async (req, res) => {
     const facebookConfig = configService.get<Facebook>('FACEBOOK');
     return res.status(HttpStatus.OK).json({
