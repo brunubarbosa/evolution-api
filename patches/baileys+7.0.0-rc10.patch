@@ -1,3 +1,20 @@
+diff --git a/node_modules/baileys/lib/Socket/messages-send.js b/node_modules/baileys/lib/Socket/messages-send.js
+index d61e064..711c0c4 100644
+--- a/node_modules/baileys/lib/Socket/messages-send.js
++++ b/node_modules/baileys/lib/Socket/messages-send.js
+@@ -904,6 +904,12 @@ export const makeMessagesSocket = (config) => {
+         return 'text';
+     };
+     const getMediaType = (message) => {
++        const inner = message.viewOnceMessage?.message
++            || message.viewOnceMessageV2?.message
++            || message.viewOnceMessageV2Extension?.message;
++        if (inner) {
++            return getMediaType(inner);
++        }
+         if (message.imageMessage) {
+             return 'image';
+         }
 diff --git a/node_modules/baileys/lib/Utils/link-preview.js b/node_modules/baileys/lib/Utils/link-preview.js
 index 0f4ff1c..57fbfb6 100644
 --- a/node_modules/baileys/lib/Utils/link-preview.js
