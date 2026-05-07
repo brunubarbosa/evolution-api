@@ -111,6 +111,36 @@ model Instance {
   Evoai                   Evoai[]
   EvoaiSetting            EvoaiSetting?
   Pusher                  Pusher?
+  // [GDW-008] Group event audit trail relation.
+  GroupEvent              GroupEvent[]
+}
+
+// [GDW-008] Group event audit trail. Populated only when GDW_PERSIST_GROUP_EVENTS=true.
+model GroupEvent {
+  id          String   @id @default(cuid())
+  instanceId  String
+  groupJid    String
+  // 'participant_update' | 'join_request' | 'stub:<NUM>' (e.g. 'stub:27' for GROUP_PARTICIPANT_ADD)
+  eventType   String
+  // What happened: e.g. 'add', 'remove', 'promote', 'created', 'revoked', 'rejected', 'subject_change'.
+  action      String?
+  // Method for join-request events: 'invite_link' | 'linked_group_join' | 'non_admin_add'.
+  method      String?
+  // Actor (admin/user who triggered) — LID and PN dual.
+  actorJid    String?
+  actorPn     String?
+  // Affected (single — for participant_update single-target events; join_request requester).
+  affectedJid String?
+  affectedPn  String?
+  // Full raw payload for callers that want the unprocessed event.
+  payload     Json
+  createdAt   DateTime @default(now())
+  Instance    Instance @relation(fields: [instanceId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@index([instanceId, groupJid, createdAt(sort: Desc)])
+  @@index([instanceId, groupJid, eventType])
+  @@index([createdAt(sort: Desc)])
+  @@map("GroupEvent")
 }
 
 model Session {

@@ -6,6 +6,8 @@ import { Logger } from '@config/logger.config';
 import { BusinessController } from './controllers/business.controller';
 import { CallController } from './controllers/call.controller';
 import { ChatController } from './controllers/chat.controller';
+// [GDW-007] Community controller registration.
+import { CommunityController } from './controllers/community.controller';
 import { GroupController } from './controllers/group.controller';
 import { InstanceController } from './controllers/instance.controller';
 import { LabelController } from './controllers/label.controller';
@@ -104,7 +106,10 @@ export const sendMessageController = new SendMessageController(waMonitor);
 export const callController = new CallController(waMonitor);
 export const chatController = new ChatController(waMonitor);
 export const businessController = new BusinessController(waMonitor);
-export const groupController = new GroupController(waMonitor);
+// [GDW-008] Pass prismaRepository so /group/events can query the audit trail.
+export const groupController = new GroupController(waMonitor, prismaRepository);
+// [GDW-007] Community REST surface — pass-through to BaileysStartupService.
+export const communityController = new CommunityController(waMonitor);
 export const labelController = new LabelController(waMonitor);
 
 export const eventManager = new EventManager(prismaRepository, waMonitor);

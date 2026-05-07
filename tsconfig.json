@@ -25,6 +25,7 @@
       "@exceptions": ["./src/exceptions"],
       "@forensic/*": ["./src/forensic/*"],
       "@libs/*": ["./src/libs/*"],
+      "@observability/*": ["./src/observability/*"],
       "@utils/*": ["./src/utils/*"],
       "@validate/*": ["./src/validate/*"]
     },

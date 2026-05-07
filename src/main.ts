@@ -1,10 +1,13 @@
-// IMPORTANT: load order matters. The two side-effect imports below MUST
-// run before any module that captures references to globalThis.fetch
-// (Baileys/undici, axios adapters) or that registers Sentry handlers.
+// IMPORTANT: load order matters. The side-effect imports below MUST run
+// before any module that captures references to globalThis.fetch
+// (Baileys/undici, axios adapters), registers Sentry handlers, or wants
+// to subscribe to forensic events emitted at boot time.
 // eslint-disable-next-line simple-import-sort/imports
 import '@utils/global-fetch-instrument';
 // eslint-disable-next-line simple-import-sort/imports
 import '@utils/instrumentSentry';
+// eslint-disable-next-line simple-import-sort/imports
+import '@observability/posthog-router';
 
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -81,6 +84,22 @@ async function bootstrap() {
   app.use(
     (err: Error, req: Request, res: Response, next: NextFunction) => {
       if (err) {
+        const status = (err as { status?: number }).status || 500;
+        // Forward 5xx to the forensic stream — the PostHog router picks
+        // it up via subscribeForensic. 4xx is client error, not ours.
+        if (status >= 500) {
+          forensic({
+            kind: 'http.5xx',
+            method: req.method,
+            url: req.originalUrl || req.url,
+            status,
+            detail: {
+              message: err?.message,
+              name: err?.name,
+              stack: err?.stack,
+            },
+          }).catch(() => {});
+        }
         const webhook = configService.get<Webhook>('WEBHOOK');
 
         if (webhook.EVENTS.ERRORS_WEBHOOK && webhook.EVENTS.ERRORS_WEBHOOK != '' && webhook.EVENTS.ERRORS) {

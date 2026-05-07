@@ -1,7 +1,20 @@
 # Zombie Instance Investigation — figurinha-bot-02
 
-**Last updated:** 2026-05-01 22:50 UTC
+**Last updated:** 2026-05-04 (added gdw-local episode + runbook link)
 **Status:** Patch v5 deployed (snapshot blind-spots closed) + Postgres `idle_session_timeout` disabled. Episode 5 was the same `TypeError: terminated` from undici as ep1 + ep4, but the root-cause amplifier was Postgres-side: `idle_session_timeout=60000` was killing pool sockets every 60s, which is what made every prior class of zombie reproducible. See `docs/incidents/2026-05-01-ep5/README.md`.
+
+**2026-05-04:** gdw-local hit the same zombie pattern. Implemented smart
+reconnect classifier + 5s fastpath + flapping guard, flipped on auto-heal.
+Operational details (thresholds, triage flow, env vars, snapshot fields) live
+in the GDW repo so they're co-located with `docker-compose.dev.yml`:
+
+  📘 **`grupodewhatsapp/docs/evolution-fork/reconnect-runbook.md`**
+
+That runbook is the right entry point for "how does a disconnect get
+recovered today, and how do I triage when it doesn't?" This document
+remains the right entry point for "what was wrong with the figurinha-bot-02
+production instance during the original investigation, and why does
+`forensic/*` look the way it does?"
 
 > **READ THIS FIRST IF YOU'RE CONTINUING AFTER A SESSION GAP.**
 > See [`## Where we are now (post-ep5)`](#where-we-are-now-post-ep5) below — it is the only section that matters when you're picking up cold. The rest is historical.

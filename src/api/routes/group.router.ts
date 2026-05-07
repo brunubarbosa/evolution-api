@@ -3,16 +3,26 @@ import {
   AcceptGroupInvite,
   CreateGroupDto,
   GetParticipant,
+  // [GDW-004] Join-request action DTOs
+  GroupAcceptInviteV4Dto,
   GroupDescriptionDto,
+  // [GDW-008] Group events query DTO
+  GroupEventsQueryDto,
   GroupInvite,
   GroupJid,
+  GroupJoinApprovalModeDto,
+  GroupMemberAddModeDto,
   GroupPictureDto,
+  GroupRevokeInviteV4Dto,
   GroupSendInvite,
   GroupSubjectDto,
   GroupToggleEphemeralDto,
   GroupUpdateParticipantDto,
+  GroupUpdatePendingRequestsDto,
   GroupUpdateSettingDto,
 } from '@api/dto/group.dto';
+// [GDW-008] InstanceDto type for the GET /group/events handler.
+import { InstanceDto } from '@api/dto/instance.dto';
 import { groupController } from '@api/server.module';
 import {
   AcceptGroupInviteSchema,
@@ -194,6 +204,95 @@ export class GroupRouter extends RouterBroker {
           execute: (instance, data) => groupController.leaveGroup(instance, data),
         });
 
+        res.status(HttpStatus.OK).json(response);
+      })
+      // ─── [GDW-004] Join-request action routes ────────────────────────────
+      // Closes the loop with GDW-002 (join-request capture). Routes are
+      // always registered (never gated by env vars); inert if not called.
+      .post(this.routerPath('acceptInviteV4'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<GroupAcceptInviteV4Dto>({
+          request: req,
+          schema: {},
+          ClassRef: GroupAcceptInviteV4Dto,
+          execute: (instance, data) => groupController.acceptInviteV4(instance, data),
+        });
+
+        res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('revokeInviteV4'), ...guards, async (req, res) => {
+        const response = await this.groupValidate<GroupRevokeInviteV4Dto>({
+          request: req,
+          schema: {},
+          ClassRef: GroupRevokeInviteV4Dto,
+          execute: (instance, data) => groupController.revokeInviteV4(instance, data),
+        });
+
+        res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('updateMemberAddMode'), ...guards, async (req, res) => {
+        const response = await this.groupValidate<GroupMemberAddModeDto>({
+          request: req,
+          schema: {},
+          ClassRef: GroupMemberAddModeDto,
+          execute: (instance, data) => groupController.updateMemberAddMode(instance, data),
+        });
+
+        res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('updateJoinApprovalMode'), ...guards, async (req, res) => {
+        const response = await this.groupValidate<GroupJoinApprovalModeDto>({
+          request: req,
+          schema: {},
+          ClassRef: GroupJoinApprovalModeDto,
+          execute: (instance, data) => groupController.updateJoinApprovalMode(instance, data),
+        });
+
+        res.status(HttpStatus.CREATED).json(response);
+      })
+      .get(this.routerPath('pendingJoinRequests'), ...guards, async (req, res) => {
+        const response = await this.groupValidate<GroupJid>({
+          request: req,
+          schema: groupJidSchema,
+          ClassRef: GroupJid,
+          execute: (instance, data) => groupController.pendingJoinRequests(instance, data),
+        });
+
+        res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('updatePendingJoinRequests'), ...guards, async (req, res) => {
+        const response = await this.groupValidate<GroupUpdatePendingRequestsDto>({
+          request: req,
+          schema: {},
+          ClassRef: GroupUpdatePendingRequestsDto,
+          execute: (instance, data) => groupController.updatePendingJoinRequests(instance, data),
+        });
+
+        res.status(HttpStatus.CREATED).json(response);
+      })
+      // ─── [GDW-008] Group event audit trail query ────────────────────────
+      // GET /group/events/:instanceName?groupJid=X&since=ISO&type=X&limit=N
+      // Always available — returns [] when persistence is disabled or no
+      // matching rows exist. See PATCHES.md GDW-008.
+      .get(this.routerPath('events'), ...guards, async (req, res) => {
+        const instance = req.params as unknown as InstanceDto;
+        const query: GroupEventsQueryDto = new GroupEventsQueryDto();
+        const q = (req.query ?? {}) as Record<string, string | undefined>;
+        let groupJid = q.groupJid;
+        if (!groupJid) {
+          res.status(HttpStatus.BAD_REQUEST).json({
+            status: HttpStatus.BAD_REQUEST,
+            error: 'Bad Request',
+            message: 'groupJid query param is required',
+          });
+          return;
+        }
+        if (!groupJid.endsWith('@g.us')) groupJid = groupJid + '@g.us';
+        query.groupJid = groupJid;
+        if (q.since) query.since = q.since;
+        if (q.type) query.type = q.type;
+        if (q.limit) query.limit = Number(q.limit);
+
+        const response = await groupController.findGroupEvents(instance, query);
         res.status(HttpStatus.OK).json(response);
       });
   }

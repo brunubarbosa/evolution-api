@@ -154,7 +154,8 @@ export class EventController {
     'CHATS_UPDATE',
     'CHATS_DELETE',
     'GROUPS_UPSERT',
-    'GROUP_UPDATE',
+    'GROUP_UPDATE', // [GDW-006] dead-code: emit path is `groups.update` → normalises to `GROUPS_UPDATE`, never matches this. Kept to avoid breaking subscription validation for anyone using the upstream-typo'd name.
+    'GROUPS_UPDATE', // [GDW-006] PATCHES.md GDW-006 — canonical name matching wa.types.ts Events.GROUPS_UPDATE. THIS is the one that actually receives groups.update events.
     'GROUP_PARTICIPANTS_UPDATE',
     'GROUP_JOIN_REQUEST', // [GDW] PATCHES.md GDW-002
     'CONNECTION_UPDATE',
