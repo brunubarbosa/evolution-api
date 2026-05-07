@@ -1,0 +1,44 @@
+diff --git a/node_modules/baileys/lib/Utils/link-preview.js b/node_modules/baileys/lib/Utils/link-preview.js
+index 0f4ff1c..b5965f8 100644
+--- a/node_modules/baileys/lib/Utils/link-preview.js
++++ b/node_modules/baileys/lib/Utils/link-preview.js
+@@ -26,6 +26,15 @@ export const getUrlInfo = async (text, opts = {
+         if (!text.startsWith('https://') && !text.startsWith('http://')) {
+             previewLink = 'https://' + previewLink;
+         }
++        // GDW patch: marketplaces (Shopee, Amazon shortlinks, etc.) gate OG
++        // metadata behind a UA allowlist — Node's default UA gets blocked or
++        // served a SPA shell. The WhatsApp client UA is allowlisted because
++        // these sites WANT shared links to preview correctly. See
++        // grupodewhatsapp/CLAUDE.md (or commit) for the test matrix.
++        const headers = {
++            'User-Agent': 'WhatsApp/2.23.20.0 A',
++            ...(opts.fetchOpts?.headers || {})
++        };
+         const info = await getLinkPreview(previewLink, {
+             ...opts.fetchOpts,
+             followRedirects: 'follow',
+@@ -45,7 +54,7 @@ export const getUrlInfo = async (text, opts = {
+                     return false;
+                 }
+             },
+-            headers: opts.fetchOpts?.headers
++            headers
+         });
+         if (info && 'title' in info && info.title) {
+             const [image] = info.images;
+@@ -56,7 +65,13 @@ export const getUrlInfo = async (text, opts = {
+                 description: info.description,
+                 originalThumbnailUrl: image
+             };
+-            if (opts.uploadImage) {
++            // GDW patch: guard the empty-image branch. Upstream calls
++            // prepareWAMessageMedia({ image: { url: undefined } }) when the OG
++            // page has no images, which throws and silently kills the whole
++            // preview (logger.warn is suppressed by LOG_BAILEYS=error). Skip
++            // the upload entirely in that case — title-only previews still
++            // render fine on the receiver side.
++            if (opts.uploadImage && image) {
+                 const { imageMessage } = await prepareWAMessageMedia({ image: { url: image } }, {
+                     upload: opts.uploadImage,
+                     mediaTypeOverride: 'thumbnail-link',
