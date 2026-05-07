@@ -3479,9 +3479,13 @@ export class BaileysStartupService extends ChannelStartupService {
         prepareMedia[mediaType].gifPlayback = false;
       }
 
+      const inner = { ...prepareMedia[mediaType] };
+      if ((mediaMessage as any).viewOnce) {
+        inner.viewOnce = true;
+      }
       const content = (mediaMessage as any).viewOnce
-        ? { viewOnceMessage: { message: { [mediaType]: { ...prepareMedia[mediaType] } } } }
-        : { [mediaType]: { ...prepareMedia[mediaType] } };
+        ? { viewOnceMessage: { message: { [mediaType]: inner } } }
+        : { [mediaType]: inner };
 
       return generateWAMessageFromContent('', content, { userJid: this.instance.wuid });
     } catch (error) {
