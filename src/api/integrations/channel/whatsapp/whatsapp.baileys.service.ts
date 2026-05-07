@@ -3479,11 +3479,11 @@ export class BaileysStartupService extends ChannelStartupService {
         prepareMedia[mediaType].gifPlayback = false;
       }
 
-      return generateWAMessageFromContent(
-        '',
-        { [mediaType]: { ...prepareMedia[mediaType] } },
-        { userJid: this.instance.wuid },
-      );
+      const content = (mediaMessage as any).viewOnce
+        ? { viewOnceMessage: { message: { [mediaType]: { ...prepareMedia[mediaType] } } } }
+        : { [mediaType]: { ...prepareMedia[mediaType] } };
+
+      return generateWAMessageFromContent('', content, { userJid: this.instance.wuid });
     } catch (error) {
       this.logger.error(error);
       throw new InternalServerErrorException(error?.toString() || error);

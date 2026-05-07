@@ -24,6 +24,9 @@ export class MediaMessage {
   fileName?: string;
   // url or base64
   media: string;
+  // wraps the outgoing message in a `viewOnceMessage` envelope so the
+  // recipient's WhatsApp client renders it as a one-time-view media bubble
+  viewOnce?: boolean;
 }
 
 export class StatusMessage {
@@ -81,6 +84,7 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+  viewOnce?: boolean;
 }
 
 export class SendPtvDto extends Metadata {

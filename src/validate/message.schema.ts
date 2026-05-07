@@ -102,6 +102,7 @@ export const mediaMessageSchema: JSONSchema7 = {
     media: { type: 'string' },
     fileName: { type: 'string' },
     caption: { type: 'string' },
+    viewOnce: { type: 'boolean', enum: [true, false] },
     delay: {
       type: 'integer',
       description: 'Enter a value in milliseconds',
