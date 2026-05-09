@@ -124,6 +124,10 @@ export declare namespace wa {
     protocol?: string;
     username?: string;
     password?: string;
+    // True when the proxy was provisioned from a rotating pool (random sticky
+    // port per session). Tells the reconnect path to rotate the port on
+    // IP-blocked errors instead of treating them as terminal.
+    poolManaged?: boolean;
   };
 
   export type StateConnection = {

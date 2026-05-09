@@ -29,6 +29,7 @@
 //   Baileys maintainer thread (2026-05-04) — confirmed 440 must be terminal,
 //   suggested 20s keepAlive, 45-60s zombie watchdog. Aligned with our impl.
 
+import { FATAL_ON_STATUS, ROTATE_ON_STATUS } from '@utils/proxyPool';
 import { DisconnectReason } from 'baileys';
 
 export type DisconnectDecision =
@@ -43,6 +44,7 @@ interface ErrorData {
 export function classifyDisconnect(
   statusCode: number | undefined | null,
   errorData?: ErrorData | null,
+  isPoolProxy = false,
 ): DisconnectDecision {
   // ─────────────── TERMINAL — pairing required ───────────────
   if (statusCode === DisconnectReason.loggedOut) {
@@ -51,8 +53,19 @@ export function classifyDisconnect(
   if (statusCode === DisconnectReason.connectionReplaced) {
     return { action: 'terminal', reason: 'connection-replaced' };
   }
+  // Pool-managed proxies: a status in ROTATE_ON_STATUS (e.g. 403) means this
+  // port's IP is blocked. The next reconnect re-runs loadProxy() and gets a
+  // fresh sticky port (the bad port is parked in the health map for 15 min).
+  if (isPoolProxy && typeof statusCode === 'number' && ROTATE_ON_STATUS.includes(statusCode)) {
+    return { action: 'reconnect', reason: 'proxy-pool-rotate', baseDelayMs: 1_000 };
+  }
   if (statusCode === DisconnectReason.forbidden) {
     return { action: 'terminal', reason: 'forbidden' };
+  }
+  // Pool-managed proxies: a status in FATAL_ON_STATUS (e.g. 407) means
+  // auth/quota is exhausted. No amount of retry helps; surface as terminal.
+  if (isPoolProxy && typeof statusCode === 'number' && FATAL_ON_STATUS.includes(statusCode)) {
+    return { action: 'terminal', reason: 'proxy-pool-fatal' };
   }
   if (statusCode === DisconnectReason.multideviceMismatch) {
     return { action: 'terminal', reason: 'multidevice-mismatch' };

@@ -374,6 +374,16 @@ export type Proxy = {
   PASSWORD?: string;
 };
 
+export type ProxyPool = {
+  ENABLED: boolean;
+  HOST: string;
+  PROTOCOL: 'http' | 'https';
+  USERNAME?: string;
+  PASSWORD?: string;
+  PORT_MIN: number;
+  PORT_MAX: number;
+};
+
 export type AudioConverter = {
   API_URL?: string;
   API_KEY?: string;
@@ -428,6 +438,7 @@ export interface Env {
   METRICS: Metrics;
   TELEMETRY: Telemetry;
   PROXY: Proxy;
+  PROXY_POOL: ProxyPool;
   AUDIO_CONVERTER: AudioConverter;
   FACEBOOK: Facebook;
   SENTRY: Sentry;
@@ -897,6 +908,15 @@ export class ConfigService {
         PROTOCOL: process.env?.PROXY_PROTOCOL,
         USERNAME: process.env?.PROXY_USERNAME,
         PASSWORD: process.env?.PROXY_PASSWORD,
+      },
+      PROXY_POOL: {
+        ENABLED: process.env?.PROXY_POOL_ENABLED === 'true',
+        HOST: process.env?.PROXY_POOL_HOST || '',
+        PROTOCOL: process.env?.PROXY_POOL_PROTOCOL === 'https' ? 'https' : 'http',
+        USERNAME: process.env?.PROXY_POOL_USERNAME,
+        PASSWORD: process.env?.PROXY_POOL_PASSWORD,
+        PORT_MIN: Number.parseInt(process.env?.PROXY_POOL_PORT_MIN || '10000', 10),
+        PORT_MAX: Number.parseInt(process.env?.PROXY_POOL_PORT_MAX || '20000', 10),
       },
       AUDIO_CONVERTER: {
         API_URL: process.env?.API_AUDIO_CONVERTER,

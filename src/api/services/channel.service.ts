@@ -14,6 +14,13 @@ import { Logger } from '@config/logger.config';
 import { NotFoundException } from '@exceptions';
 import { Contact, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
+import {
+  buildProxyPoolEntry,
+  isProxyPoolEnabled,
+  pickProxyPoolPort,
+  ProxyPoolConfig,
+  recentlyBadPorts,
+} from '@utils/proxyPool';
 import { WASocket } from 'baileys';
 import { isArray } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
@@ -364,30 +371,53 @@ export class ChannelStartupService {
 
   public async loadProxy() {
     this.localProxy.enabled = false;
+    this.localProxy.poolManaged = false;
 
-    const proxyConfig = this.configService.get<Proxy>('PROXY');
-    if (proxyConfig.HOST) {
-      this.localProxy.enabled = true;
-      this.localProxy.host = proxyConfig.HOST;
-      this.localProxy.port = proxyConfig.PORT || '80';
-      this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
-      this.localProxy.username = proxyConfig.USERNAME;
-      this.localProxy.password = proxyConfig.PASSWORD;
-    }
-
+    // Resolution order: per-instance row (explicit disable wins, then explicit
+    // enable) -> global PROXY_* env -> rotating proxy pool fallback.
     const data = await this.prismaRepository.proxy.findUnique({
       where: {
         instanceId: this.instanceId,
       },
     });
 
-    if (data?.enabled) {
+    if (data) {
+      if (data.enabled === false) {
+        this.localProxy.enabled = false;
+        return;
+      }
       this.localProxy.enabled = true;
-      this.localProxy.host = data?.host;
-      this.localProxy.port = data?.port;
-      this.localProxy.protocol = data?.protocol;
-      this.localProxy.username = data?.username;
-      this.localProxy.password = data?.password;
+      this.localProxy.host = data.host;
+      this.localProxy.port = data.port;
+      this.localProxy.protocol = data.protocol;
+      this.localProxy.username = data.username;
+      this.localProxy.password = data.password;
+      return;
+    }
+
+    const proxyConfig = this.configService.get<Proxy>('PROXY');
+    if (proxyConfig?.HOST) {
+      this.localProxy.enabled = true;
+      this.localProxy.host = proxyConfig.HOST;
+      this.localProxy.port = proxyConfig.PORT || '80';
+      this.localProxy.protocol = proxyConfig.PROTOCOL || 'http';
+      this.localProxy.username = proxyConfig.USERNAME;
+      this.localProxy.password = proxyConfig.PASSWORD;
+      return;
+    }
+
+    if (isProxyPoolEnabled(this.configService)) {
+      const cfg = this.configService.get<ProxyPoolConfig>('PROXY_POOL');
+      const port = pickProxyPoolPort(cfg, recentlyBadPorts());
+      const entry = buildProxyPoolEntry(cfg, port);
+      this.localProxy.enabled = true;
+      this.localProxy.poolManaged = true;
+      this.localProxy.host = entry.host;
+      this.localProxy.port = entry.port;
+      this.localProxy.protocol = entry.protocol;
+      this.localProxy.username = entry.username;
+      this.localProxy.password = entry.password;
+      this.logger.info(`[proxy-pool] picked port=${port} instance=${this.instance?.name ?? '-'}`);
     }
   }
 

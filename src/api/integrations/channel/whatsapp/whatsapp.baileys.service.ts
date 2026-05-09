@@ -108,6 +108,7 @@ import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { makeProxyAgent, makeProxyAgentUndici } from '@utils/makeProxyAgent';
 import { getOnWhatsappCache, saveOnWhatsappCache } from '@utils/onWhatsappCache';
+import { disableForProcess, FATAL_ON_STATUS, markPortBad, ROTATE_ON_STATUS } from '@utils/proxyPool';
 import { status } from '@utils/renderStatus';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
@@ -567,7 +568,22 @@ export class BaileysStartupService extends ChannelStartupService {
       // ends up — needed to distinguish a logout-style 401 from a "another
       // device replaced you" 401 (which is conflict + device_removed).
       const errorData = (boomErr as any)?.data;
-      const decision = classifyDisconnect(statusCode, errorData);
+      const poolManaged = this.localProxy?.poolManaged === true;
+      const decision = classifyDisconnect(statusCode, errorData, poolManaged);
+
+      // Pool-managed proxy side effects: park a bad port for 15 min so the
+      // next loadProxy() avoids it, and trip the process-wide kill switch on
+      // a quota/auth error so we don't pile thousands of instances onto a
+      // misconfigured plan.
+      if (poolManaged && typeof statusCode === 'number' && ROTATE_ON_STATUS.includes(statusCode)) {
+        markPortBad(this.localProxy?.port ?? 0);
+        this.logger.warn(
+          `[proxy-pool] ${statusCode} on port=${this.localProxy?.port} instance=${this.instance.name} — rotating on next reconnect`,
+        );
+      }
+      if (poolManaged && typeof statusCode === 'number' && FATAL_ON_STATUS.includes(statusCode)) {
+        disableForProcess(`${statusCode} from ${this.localProxy?.host}:${this.localProxy?.port}`);
+      }
 
       const tracked = instanceTracker.recordReconnectDecision(this.instance.name, decision.action, {
         reason: decision.reason,
@@ -786,22 +802,20 @@ export class BaileysStartupService extends ChannelStartupService {
           this.localProxy.enabled = false;
         }
       } else {
-        options = {
-          agent: makeProxyAgent({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
-          fetchAgent: makeProxyAgentUndici({
-            host: this.localProxy.host,
-            port: this.localProxy.port,
-            protocol: this.localProxy.protocol,
-            username: this.localProxy.username,
-            password: this.localProxy.password,
-          }),
+        const proxyShape = {
+          host: this.localProxy.host,
+          port: this.localProxy.port,
+          protocol: this.localProxy.protocol,
+          username: this.localProxy.username,
+          password: this.localProxy.password,
         };
+        options = {
+          agent: makeProxyAgent(proxyShape),
+          fetchAgent: makeProxyAgentUndici(proxyShape),
+        };
+        if (this.localProxy.poolManaged) {
+          this.logger.info(`[proxy-pool] connecting via port=${this.localProxy.port}`);
+        }
       }
     }
 
@@ -1201,6 +1215,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
   public async reloadConnection(): Promise<WASocket> {
     try {
+      // Re-run loadProxy so a pool-managed proxy picks a fresh sticky port on
+      // manual reloads; otherwise we'd keep reusing the previous port forever.
+      await this.loadProxy();
       return await this.createClient(this.phoneNumber);
     } catch (error) {
       this.logger.error(error);
