@@ -809,12 +809,21 @@ export class BaileysStartupService extends ChannelStartupService {
           username: this.localProxy.username,
           password: this.localProxy.password,
         };
-        options = {
-          agent: makeProxyAgent(proxyShape),
-          fetchAgent: makeProxyAgentUndici(proxyShape),
-        };
+        // Pool-managed residential proxies handle WS frames fine but choke on
+        // streaming POSTs to mmg.whatsapp.net (Baileys passes a Readable +
+        // duplex:'half' to undici, which most residential pools drop). Keep
+        // the proxy on the WS leg only and let media uploads go direct from
+        // the host IP to WhatsApp's CDN.
         if (this.localProxy.poolManaged) {
-          this.logger.info(`[proxy-pool] connecting via port=${this.localProxy.port}`);
+          options = {
+            agent: makeProxyAgent(proxyShape),
+          };
+          this.logger.info(`[proxy-pool] connecting via port=${this.localProxy.port} (media uploads bypass proxy)`);
+        } else {
+          options = {
+            agent: makeProxyAgent(proxyShape),
+            fetchAgent: makeProxyAgentUndici(proxyShape),
+          };
         }
       }
     }
@@ -3367,7 +3376,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (isURL(mediaMessage.media)) {
           let config: any = { responseType: 'arraybuffer' };
 
-          if (this.localProxy?.enabled) {
+          if (this.localProxy?.enabled && !this.localProxy?.poolManaged) {
             config = {
               ...config,
               httpsAgent: makeProxyAgent({
@@ -3428,7 +3437,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (!mimetype && isURL(mediaMessage.media)) {
           let config: any = { responseType: 'arraybuffer' };
 
-          if (this.localProxy?.enabled) {
+          if (this.localProxy?.enabled && !this.localProxy?.poolManaged) {
             config = {
               ...config,
               httpsAgent: makeProxyAgent({
@@ -3526,7 +3535,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         let config: any = { responseType: 'arraybuffer' };
 
-        if (this.localProxy?.enabled) {
+        if (this.localProxy?.enabled && !this.localProxy?.poolManaged) {
           config = {
             ...config,
             httpsAgent: makeProxyAgent({
@@ -4685,7 +4694,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         let config: any = { responseType: 'arraybuffer' };
 
-        if (this.localProxy?.enabled) {
+        if (this.localProxy?.enabled && !this.localProxy?.poolManaged) {
           config = {
             ...config,
             httpsAgent: makeProxyAgent({
@@ -4979,7 +4988,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         let config: any = { responseType: 'arraybuffer' };
 
-        if (this.localProxy?.enabled) {
+        if (this.localProxy?.enabled && !this.localProxy?.poolManaged) {
           config = {
             ...config,
             httpsAgent: makeProxyAgent({
