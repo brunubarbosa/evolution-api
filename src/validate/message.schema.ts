@@ -103,6 +103,8 @@ export const mediaMessageSchema: JSONSchema7 = {
     fileName: { type: 'string' },
     caption: { type: 'string' },
     viewOnce: { type: 'boolean', enum: [true, false] },
+    // [GDW-006] gifPlayback toggle for video mediatype
+    gifPlayback: { type: 'boolean', enum: [true, false] },
     delay: {
       type: 'integer',
       description: 'Enter a value in milliseconds',

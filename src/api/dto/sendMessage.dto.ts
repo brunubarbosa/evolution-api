@@ -27,6 +27,8 @@ export class MediaMessage {
   // wraps the outgoing message in a `viewOnceMessage` envelope so the
   // recipient's WhatsApp client renders it as a one-time-view media bubble
   viewOnce?: boolean;
+  // [GDW-006] when mediatype === 'video', render as GIF (autoplay/loop, no audio)
+  gifPlayback?: boolean;
 }
 
 export class StatusMessage {

@@ -3502,7 +3502,8 @@ export class BaileysStartupService extends ChannelStartupService {
       prepareMedia[mediaType].fileName = mediaMessage.fileName;
 
       if (mediaMessage.mediatype === 'video') {
-        prepareMedia[mediaType].gifPlayback = false;
+        // [GDW-006] honor caller's gifPlayback flag (default false preserves upstream behavior)
+        prepareMedia[mediaType].gifPlayback = (mediaMessage as any).gifPlayback === true;
       }
 
       const inner = { ...prepareMedia[mediaType] };
