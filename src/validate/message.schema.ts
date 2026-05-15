@@ -71,7 +71,26 @@ export const textMessageSchema: JSONSchema7 = {
   properties: {
     number: { ...numberDefinition },
     text: { type: 'string' },
-    linkPreview: { type: 'boolean' },
+    // [GDW-007] Either a boolean toggle (auto-generate / suppress) or
+    // a CustomLinkPreview object so the caller can ship a sender-controlled
+    // preview card (matched-text + canonical-url + title + description
+    // + optional base64 thumbnail).
+    linkPreview: {
+      oneOf: [
+        { type: 'boolean' },
+        {
+          type: 'object',
+          properties: {
+            'matched-text': { type: 'string' },
+            'canonical-url': { type: 'string' },
+            title: { type: 'string' },
+            description: { type: 'string' },
+            jpegThumbnailBase64: { type: 'string' },
+          },
+          required: ['matched-text', 'canonical-url', 'title'],
+        },
+      ],
+    },
     delay: {
       type: 'integer',
       description: 'Enter a value in milliseconds',

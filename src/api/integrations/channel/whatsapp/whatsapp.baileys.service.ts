@@ -2961,7 +2961,32 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      const linkPreview = options?.linkPreview != false ? undefined : false;
+      // [GDW-007] Three states:
+      //   - `false`             → suppress preview entirely
+      //   - object (WAUrlInfo)  → ship a sender-controlled preview card.
+      //                           Caller passes jpegThumbnailBase64 as a
+      //                           base64 string; we coerce it to Buffer
+      //                           here so Baileys receives the WAUrlInfo
+      //                           shape it expects (jpegThumbnail: Buffer).
+      //   - undefined/true/any  → let WhatsApp client auto-generate from
+      //                           og: tags on the recipient's side.
+      let linkPreview: any;
+      if (options?.linkPreview === false) {
+        linkPreview = false;
+      } else if (options?.linkPreview && typeof options.linkPreview === 'object') {
+        const lp = options.linkPreview as any;
+        linkPreview = {
+          'canonical-url': lp['canonical-url'],
+          'matched-text': lp['matched-text'],
+          title: lp.title,
+          description: lp.description,
+          ...(typeof lp.jpegThumbnailBase64 === 'string' && lp.jpegThumbnailBase64.length > 0
+            ? { jpegThumbnail: Buffer.from(lp.jpegThumbnailBase64, 'base64') }
+            : {}),
+        };
+      } else {
+        linkPreview = undefined;
+      }
 
       let quoted: WAMessage;
 

@@ -5,11 +5,34 @@ export class Quoted {
   message: proto.IMessage;
 }
 
+// [GDW-007] Custom link preview override. Baileys accepts a WAUrlInfo
+// object on the linkPreview option which lets the sender control the
+// title/description/thumbnail of the preview card instead of relying on
+// the recipient's WhatsApp client to fetch og: tags. We expose it on
+// SendTextDto so GDW can ship user-edited preview cards. The "matched-text"
+// field MUST appear verbatim in the message body; otherwise WhatsApp
+// drops the preview silently.
+export class CustomLinkPreview {
+  // The URL substring that appears in the message body. Baileys uses
+  // this to locate the preview anchor — typo here = preview dropped.
+  'matched-text': string;
+  // The final URL the preview points at (after redirects). Can equal
+  // matched-text when there's no redirect.
+  'canonical-url': string;
+  title: string;
+  description?: string;
+  // Base64-encoded JPEG/PNG bytes (no data: prefix). Optional —
+  // omitting it ships a text-only preview card.
+  jpegThumbnailBase64?: string;
+}
+
 export class Options {
   delay?: number;
   presence?: WAPresence;
   quoted?: Quoted;
-  linkPreview?: boolean;
+  // Backwards-compat: boolean disables (false) or auto-generates (true/undef).
+  // Object form ships a fully custom WAUrlInfo preview card.
+  linkPreview?: boolean | CustomLinkPreview;
   encoding?: boolean;
   mentionsEveryOne?: boolean;
   mentioned?: string[];
@@ -45,7 +68,9 @@ export class Metadata {
   number: string;
   delay?: number;
   quoted?: Quoted;
-  linkPreview?: boolean;
+  // Backwards-compat: boolean. Object form (see CustomLinkPreview) ships
+  // a fully sender-controlled preview card.
+  linkPreview?: boolean | CustomLinkPreview;
   mentionsEveryOne?: boolean;
   mentioned?: string[];
   encoding?: boolean;
