@@ -11,8 +11,10 @@
  * the WS frame leaves. Grouped by `trace_id` you get a 4-layer chain per
  * outbound message.
  *
- * Always on — no feature flag. The cache Redis client must be ENABLED
- * (`CACHE_REDIS_ENABLED=true` + `CACHE_REDIS_URI=...`); when it isn't,
+ * Always on — no feature flag. The tracer needs its own Redis (separate
+ * from Evolution's cache Redis because the worker doesn't share that
+ * one). Reads `OUTBOUND_TRACE_REDIS_URL` and falls back to the cache
+ * Redis URI as a safety net. When the connection is missing/broken,
  * breadcrumbs silently no-op — never break a send.
  *
  * This file is intentionally standalone — no dependency on the Logger
@@ -23,8 +25,7 @@
 
 import { AsyncLocalStorage } from 'async_hooks';
 import { randomUUID } from 'crypto';
-
-import { redisClient } from '../cache/rediscache.client';
+import { createClient, RedisClientType } from 'redis';
 
 /**
  * Per-request trace context, populated by the Express middleware in
@@ -54,6 +55,60 @@ export function mintTraceId(): string {
 export type TraceLayer = 'L2.http' | 'L3.send' | 'L4.relay';
 
 /**
+ * Dedicated Redis client for the tracer. Separate from Evolution's
+ * cache Redis so we can point it at the worker's Redis (where the L1
+ * breadcrumbs live) and keep the cache local. Set
+ * `OUTBOUND_TRACE_REDIS_URL` to the same URL the worker uses; absent,
+ * we fall back to `CACHE_REDIS_URI` so behavior is correct in dev /
+ * single-Redis setups.
+ */
+let traceClient: RedisClientType | null = null;
+let traceClientInitAttempted = false;
+
+function getTraceClient(): RedisClientType | null {
+  if (traceClient) return traceClient;
+  if (traceClientInitAttempted) return null;
+  traceClientInitAttempted = true;
+
+  const url = process.env.OUTBOUND_TRACE_REDIS_URL || process.env.CACHE_REDIS_URI;
+  if (!url) return null;
+
+  try {
+    const c = createClient({ url });
+    // .on('error') is critical: node-redis throws on unhandled errors,
+    // which would crash the entire process for a tracer hiccup. We log
+    // to stderr (forensic JSONL pipeline will pick it up) and otherwise
+    // soldier on — broken Redis must not break sends.
+    c.on('error', (err) => {
+      try {
+        process.stderr.write(`[outbound-trace] redis error ${err?.message ?? err}\n`);
+      } catch {
+        /* noop */
+      }
+    });
+    // Fire connect async; the first XADD will resolve once ready.
+    // node-redis v4 queues commands while connecting, so we don't need
+    // to await this explicitly.
+    c.connect().catch((err) => {
+      try {
+        process.stderr.write(`[outbound-trace] redis connect failed: ${err?.message ?? err}\n`);
+      } catch {
+        /* noop */
+      }
+    });
+    traceClient = c as RedisClientType;
+    return traceClient;
+  } catch (err) {
+    try {
+      process.stderr.write(`[outbound-trace] redis client init failed: ${(err as Error)?.message ?? err}\n`);
+    } catch {
+      /* noop */
+    }
+    return null;
+  }
+}
+
+/**
  * Fire-and-forget — caller MUST NOT await unless they want the trace
  * write to gate the actual send. We swallow every error: the tracer
  * exists to help debug; it must never be a blast radius.
@@ -63,14 +118,7 @@ export function emitTraceFireAndForget(
   layer: TraceLayer,
   fields: Record<string, string | number | boolean | undefined | null>,
 ): void {
-  // Lazy-grab; the cache singleton handles connect on first use.
-  const client = (() => {
-    try {
-      return redisClient.getConnection();
-    } catch {
-      return null;
-    }
-  })();
+  const client = getTraceClient();
   if (!client) return;
 
   // Flatten the fields object → XADD's pair-list, dropping undefined/null
