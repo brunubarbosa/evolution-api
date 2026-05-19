@@ -736,7 +736,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return webMessageInfo[0].message;
     } catch {
-      return { conversation: '' };
+      // [GDW] Empty-bubble root cause. Returning `{ conversation: '' }`
+      // here makes Baileys' retry-resend path ship a non-falsy message to
+      // the peer requesting the retry — which means an empty stanza with
+      // a sender-key-distribution fan-out gets sent to every group device,
+      // and some WhatsApp clients render the empty conversation as a
+      // blank bubble. Returning `undefined` instead drops into the
+      // `recv retry request, but message not available` branch (see
+      // baileys/src/Socket/messages-recv.ts) so the retry is skipped
+      // entirely. This is the well-behaved fallback for "store lookup
+      // failed" and avoids the empty-bubble pattern entirely.
+      return undefined as unknown as proto.IMessage;
     }
   }
 
