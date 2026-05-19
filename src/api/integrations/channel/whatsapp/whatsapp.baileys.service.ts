@@ -891,6 +891,25 @@ export class BaileysStartupService extends ChannelStartupService {
           message.listMessage.listType = proto.Message.ListMessage.ListType.SINGLE_SELECT;
         }
 
+        // [GDW] Empty-bubble defense. When a sender-key distribution
+        // payload is being shipped, ensure no zero-length `conversation`
+        // string sneaks onto the wire. proto2's `optional string`
+        // serializes `""` and certain WhatsApp clients render that as a
+        // blank message bubble. We confirmed up to ~590 receiver-side
+        // decode rows per 24h in groups where two of our bots co-admin,
+        // with <5 visibly leaking through the client filter.
+        // Filter is intentionally narrow: only strips when SKDM is
+        // present AND conversation is exactly an empty string, so real
+        // empty-text sends (none in our worker) are unaffected.
+        if (
+          message?.senderKeyDistributionMessage &&
+          'conversation' in (message as Record<string, unknown>) &&
+          (message as { conversation?: string }).conversation === ''
+        ) {
+          message = JSON.parse(JSON.stringify(message));
+          delete (message as { conversation?: string }).conversation;
+        }
+
         return message;
       },
     };

@@ -1,5 +1,5 @@
 diff --git a/node_modules/baileys/lib/Socket/messages-send.js b/node_modules/baileys/lib/Socket/messages-send.js
-index d61e064..578c48e 100644
+index d61e064..dd89859 100644
 --- a/node_modules/baileys/lib/Socket/messages-send.js
 +++ b/node_modules/baileys/lib/Socket/messages-send.js
 @@ -10,6 +10,46 @@ import { buildMergedTcTokenIndexWrite, isTcTokenExpired, resolveIssuanceJid, res
@@ -49,25 +49,80 @@ index d61e064..578c48e 100644
  export const makeMessagesSocket = (config) => {
      const { logger, linkPreviewImageThumbnailWidth, generateHighQualityLinkPreview, options: httpRequestOptions, patchMessageBeforeSending, cachedGroupMetadata, enableRecentMessageCache, maxMsgRetryCount } = config;
      const sock = makeNewsletterSocket(config);
-@@ -425,7 +465,7 @@ export const makeMessagesSocket = (config) => {
+@@ -425,12 +465,25 @@ export const makeMessagesSocket = (config) => {
          }
          return { nodes, shouldIncludeDeviceIdentity };
      };
 -    const relayMessage = async (jid, message, { messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList }) => {
-+    const relayMessage = async (jid, message, { messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList, traceId }) => {
++    const relayMessage = async (jid, message, { messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList, traceId: callerTraceId }) => {
++        // [GDW] Synthesize a trace_id when the upstream caller didn't
++        // pass one. Without this, internal Baileys flows (sender-key
++        // redistribution, retry resends) ship to the wire without an
++        // L4.relay breadcrumb, which is exactly the case that left the
++        // empty-bubble incident invisible in the outbound:trace stream.
++        const traceId = callerTraceId ||
++            (typeof globalThis.crypto?.randomUUID === 'function'
++                ? globalThis.crypto.randomUUID()
++                : `bly-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`);
++        const traceOrigin = callerTraceId ? 'upstream' : 'baileys-internal';
          const meId = assertMeId(authState.creds);
          const meLid = authState.creds.me?.lid;
          const isRetryResend = Boolean(participant?.jid);
-@@ -489,6 +529,8 @@ export const makeMessagesSocket = (config) => {
+         let shouldIncludeDeviceIdentity = isRetryResend;
+         const statusJid = 'status@broadcast';
++        // [GDW] Recipient count bubbled into the L4 breadcrumb so we
++        // can spot sender-key redistribution storms in `outbound:trace`.
++        let skdmRecipientCount = 0;
+         const { user, server } = jidDecode(jid);
+         const isGroup = server === 'g.us';
+         const isStatus = jid === statusJid;
+@@ -489,6 +542,7 @@ export const makeMessagesSocket = (config) => {
                      content: binaryNodeContent
                  };
                  logger.debug({ msgId }, `sending newsletter message to ${jid}`);
-+                if (traceId)
-+                    emitGdwTrace(traceId, 'newsletter', { jid, msgId, kind: 'newsletter' });
++                emitGdwTrace(traceId, 'newsletter', { jid, msgId, kind: 'newsletter', origin: traceOrigin });
                  await sendNode(stanza);
                  return;
              }
-@@ -832,6 +874,23 @@ export const makeMessagesSocket = (config) => {
+@@ -564,6 +618,12 @@ export const makeMessagesSocket = (config) => {
+                 }
+                 if (senderKeyRecipients.length) {
+                     logger.debug({ senderKeyJids: senderKeyRecipients }, 'sending new sender key');
++                    skdmRecipientCount = senderKeyRecipients.length;
++                    // [GDW] SKDM-only payload — no `conversation` field is
++                    // attached, so the protobuf wire is clean. Defined
++                    // inline (no spread of `message`) to make the absence
++                    // explicit; if a future Baileys change introduces a
++                    // spread here, the empty-bubble bug would resurface.
+                     const senderKeyMsg = {
+                         senderKeyDistributionMessage: {
+                             axolotlSenderKeyDistributionMessage: senderKeyDistributionMessage,
+@@ -685,13 +745,23 @@ export const makeMessagesSocket = (config) => {
+                                 group: destinationJid,
+                                 meId: groupSenderIdentity
+                             });
++                            // [GDW] Empty-bubble defense. Spread of the
++                            // original `message` would carry a stray
++                            // `conversation: ""` to the wire — protobuf2
++                            // serializes the empty string and some
++                            // WhatsApp clients render it as a blank
++                            // bubble. Strip the field before the spread.
++                            const baseMessage = (message && typeof message === 'object' && message.conversation === '')
++                                ? (() => { const clone = { ...message }; delete clone.conversation; return clone; })()
++                                : message;
+                             messageToSend = {
+-                                ...message,
++                                ...baseMessage,
+                                 senderKeyDistributionMessage: {
+                                     groupId: destinationJid,
+                                     axolotlSenderKeyDistributionMessage: skdm
+                                 }
+                             };
++                            if (!skdmRecipientCount) skdmRecipientCount = 1;
+                         }
+                         catch (err) {
+                             logger.warn({ err, jid: destinationJid }, 'failed to build SKDM for retry, sending without it');
+@@ -832,6 +902,28 @@ export const makeMessagesSocket = (config) => {
                  stanza.content.push(...additionalNodes);
              }
              logger.debug({ msgId }, `sending message to ${participants.length} devices`);
@@ -75,23 +130,28 @@ index d61e064..578c48e 100644
 +            // WS frame is flushed. Stderr-only line for docker logs plus a
 +            // globalThis hook the Evolution wrapper uses to XADD into the
 +            // shared `outbound:trace` Redis Stream.
-+            if (traceId) {
-+                emitGdwTrace(traceId, 'main', {
-+                    jid,
-+                    msgId,
-+                    destinationJid,
-+                    devices: participants.length,
-+                    isGroup: isGroup ? 1 : 0,
-+                    isStatus: isStatus ? 1 : 0,
-+                    isLid: isLid ? 1 : 0,
-+                    isRetryResend: isRetryResend ? 1 : 0,
-+                    stanzaType: stanza.attrs?.type ?? ''
-+                });
-+            }
++            // Fires unconditionally: caller-supplied traces close the
++            // L1→L4 chain, caller-less internal flows (sender-key
++            // redistribution, retry resends) synthesize a fresh trace_id
++            // so the wire-level event isn't invisible.
++            emitGdwTrace(traceId, 'main', {
++                jid,
++                msgId,
++                destinationJid,
++                devices: participants.length,
++                isGroup: isGroup ? 1 : 0,
++                isStatus: isStatus ? 1 : 0,
++                isLid: isLid ? 1 : 0,
++                isRetryResend: isRetryResend ? 1 : 0,
++                stanzaType: stanza.attrs?.type ?? '',
++                origin: traceOrigin,
++                message_keys: Object.keys(message || {}).filter(k => k !== 'messageContextInfo').join(','),
++                skdm_recipients: skdmRecipientCount
++            });
              await sendNode(stanza);
              // Fire-and-forget: issue our token to the contact AFTER message send.
              // WA Web skips protocol messages and PSA/bot contacts (TcTokenChatAction: isRegularUser)
-@@ -904,6 +963,12 @@ export const makeMessagesSocket = (config) => {
+@@ -904,6 +996,12 @@ export const makeMessagesSocket = (config) => {
          return 'text';
      };
      const getMediaType = (message) => {
