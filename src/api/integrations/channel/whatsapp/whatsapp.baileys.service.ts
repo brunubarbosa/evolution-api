@@ -101,6 +101,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { forensic } from '@forensic/forensic-logger';
 import { instanceTracker } from '@forensic/instance-tracker';
+import { emitTraceFireAndForget, outboundTraceContext, shortHash } from '@forensic/outbound-trace';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message } from '@prisma/client';
@@ -2777,6 +2778,38 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // NOTE: NÃO DEVEMOS GERAR O messageId AQUI, SOMENTE SE VIER INFORMADO POR PARAMETRO. A GERAÇÃO ANTERIOR IMPEDE O WZAP DE IDENTIFICAR A SOURCE.
     if (messageId) option.messageId = messageId;
+
+    // Temporary outbound tracer — L3.send. Reads the trace_id stashed by
+    // the HTTP-entry middleware via AsyncLocalStorage so we don't have to
+    // thread it through every controller method. Emit BEFORE the actual
+    // Baileys handoff so a hang/throw downstream still leaves an L3 row.
+    const traceStore = outboundTraceContext.getStore();
+    if (traceStore) {
+      const text =
+        message?.conversation ??
+        message?.extendedTextMessage?.text ??
+        message?.imageMessage?.caption ??
+        message?.videoMessage?.caption ??
+        message?.documentMessage?.caption ??
+        '';
+      emitTraceFireAndForget(traceStore.traceId, 'L3.send', {
+        instance: this.instance?.name ?? '',
+        instance_wuid: this.instance?.wuid ?? '',
+        sender,
+        is_group: isJidGroup(sender) ? '1' : '0',
+        has_quoted: option.quoted ? '1' : '0',
+        ephemeral: ephemeralExpiration ? String(ephemeralExpiration) : '0',
+        message_keys: Object.keys(message ?? {}).join(','),
+        body_hash: shortHash(text),
+        body_preview: typeof text === 'string' ? text.slice(0, 200) : '',
+        // Pass the trace id into Baileys via the options bag. Baileys
+        // patch reads `option.traceId` and emits L4.relay right before
+        // sendNode(stanza). The field is unknown to upstream Baileys, so
+        // omitting the patch is a no-op (just no L4 breadcrumb).
+        origin: traceStore.origin,
+      });
+      option.traceId = traceStore.traceId;
+    }
 
     if (message['viewOnceMessage']) {
       const m = generateWAMessageFromContent(sender, message, {

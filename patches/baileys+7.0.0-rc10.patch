@@ -1,8 +1,97 @@
 diff --git a/node_modules/baileys/lib/Socket/messages-send.js b/node_modules/baileys/lib/Socket/messages-send.js
-index d61e064..711c0c4 100644
+index d61e064..578c48e 100644
 --- a/node_modules/baileys/lib/Socket/messages-send.js
 +++ b/node_modules/baileys/lib/Socket/messages-send.js
-@@ -904,6 +904,12 @@ export const makeMessagesSocket = (config) => {
+@@ -10,6 +10,46 @@ import { buildMergedTcTokenIndexWrite, isTcTokenExpired, resolveIssuanceJid, res
+ import { areJidsSameUser, getBinaryNodeChild, getBinaryNodeChildren, isHostedLidUser, isHostedPnUser, isJidBot, isJidGroup, isJidMetaAI, isLidUser, isPnUser, jidDecode, jidEncode, jidNormalizedUser, PSA_WID, S_WHATSAPP_NET } from '../WABinary/index.js';
+ import { USyncQuery, USyncUser } from '../WAUSync/index.js';
+ import { makeNewsletterSocket } from './newsletter.js';
++// [GDW] Outbound tracer hook — final breadcrumb before the encrypted
++// WhatsApp message stanza is flushed to the WS socket. The Evolution
++// wrapper consumes this via globalThis.__gdwOutboundTraceHook__ and
++// XADDs to the `outbound:trace` Redis Stream alongside L1/L2/L3. The
++// stderr line keeps the breadcrumb in `docker logs` if the in-process
++// hook is absent. Best-effort + bounded payload so a broken stderr
++// pipe is never propagated. Active whenever opts.traceId is set; no
++// env flag.
++function emitGdwTrace(traceId, subKind, extras) {
++    try {
++        const safe = {};
++        for (const [k, v] of Object.entries(extras)) {
++            if (v === undefined || v === null)
++                continue;
++            safe[k] = v;
++        }
++        const payload = {
++            gdw_trace: 1,
++            ts: new Date().toISOString(),
++            pid: process.pid,
++            layer: 'L4.relay',
++            trace_id: traceId,
++            sub_kind: subKind,
++            ...safe
++        };
++        process.stderr.write(JSON.stringify(payload) + '\n');
++        const hook = globalThis.__gdwOutboundTraceHook__;
++        if (typeof hook === 'function') {
++            try {
++                hook(payload);
++            }
++            catch {
++                /* hook errors must never break a send */
++            }
++        }
++    }
++    catch {
++        /* tracer must never break a send */
++    }
++}
+ export const makeMessagesSocket = (config) => {
+     const { logger, linkPreviewImageThumbnailWidth, generateHighQualityLinkPreview, options: httpRequestOptions, patchMessageBeforeSending, cachedGroupMetadata, enableRecentMessageCache, maxMsgRetryCount } = config;
+     const sock = makeNewsletterSocket(config);
+@@ -425,7 +465,7 @@ export const makeMessagesSocket = (config) => {
+         }
+         return { nodes, shouldIncludeDeviceIdentity };
+     };
+-    const relayMessage = async (jid, message, { messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList }) => {
++    const relayMessage = async (jid, message, { messageId: msgId, participant, additionalAttributes, additionalNodes, useUserDevicesCache, useCachedGroupMetadata, statusJidList, traceId }) => {
+         const meId = assertMeId(authState.creds);
+         const meLid = authState.creds.me?.lid;
+         const isRetryResend = Boolean(participant?.jid);
+@@ -489,6 +529,8 @@ export const makeMessagesSocket = (config) => {
+                     content: binaryNodeContent
+                 };
+                 logger.debug({ msgId }, `sending newsletter message to ${jid}`);
++                if (traceId)
++                    emitGdwTrace(traceId, 'newsletter', { jid, msgId, kind: 'newsletter' });
+                 await sendNode(stanza);
+                 return;
+             }
+@@ -832,6 +874,23 @@ export const makeMessagesSocket = (config) => {
+                 stanza.content.push(...additionalNodes);
+             }
+             logger.debug({ msgId }, `sending message to ${participants.length} devices`);
++            // [GDW] Outbound tracer — L4.relay, final breadcrumb before the
++            // WS frame is flushed. Stderr-only line for docker logs plus a
++            // globalThis hook the Evolution wrapper uses to XADD into the
++            // shared `outbound:trace` Redis Stream.
++            if (traceId) {
++                emitGdwTrace(traceId, 'main', {
++                    jid,
++                    msgId,
++                    destinationJid,
++                    devices: participants.length,
++                    isGroup: isGroup ? 1 : 0,
++                    isStatus: isStatus ? 1 : 0,
++                    isLid: isLid ? 1 : 0,
++                    isRetryResend: isRetryResend ? 1 : 0,
++                    stanzaType: stanza.attrs?.type ?? ''
++                });
++            }
+             await sendNode(stanza);
+             // Fire-and-forget: issue our token to the contact AFTER message send.
+             // WA Web skips protocol messages and PSA/bot contacts (TcTokenChatAction: isRegularUser)
+@@ -904,6 +963,12 @@ export const makeMessagesSocket = (config) => {
          return 'text';
      };
      const getMediaType = (message) => {
@@ -15,6 +104,22 @@ index d61e064..711c0c4 100644
          if (message.imageMessage) {
              return 'image';
          }
+diff --git a/node_modules/baileys/lib/Types/Message.d.ts b/node_modules/baileys/lib/Types/Message.d.ts
+index 0004fb6..0ee00f1 100644
+--- a/node_modules/baileys/lib/Types/Message.d.ts
++++ b/node_modules/baileys/lib/Types/Message.d.ts
+@@ -222,6 +222,11 @@ type MinimalRelayOptions = {
+     messageId?: string;
+     /** should we use group metadata cache, or fetch afresh from the server; default assumed to be "true" */
+     useCachedGroupMetadata?: boolean;
++    /** [GDW] End-to-end outbound tracer. When set, relayMessage writes a
++     *  structured JSON line to stderr and calls
++     *  globalThis.__gdwOutboundTraceHook__ just before the WS frame is
++     *  flushed. Read by the trace-outbound CLI; opaque/no-op when absent. */
++    traceId?: string;
+ };
+ export type MessageRelayOptions = MinimalRelayOptions & {
+     /** only send to a specific participant; used when a message decryption fails for a single user */
 diff --git a/node_modules/baileys/lib/Utils/link-preview.js b/node_modules/baileys/lib/Utils/link-preview.js
 index 0f4ff1c..57fbfb6 100644
 --- a/node_modules/baileys/lib/Utils/link-preview.js
