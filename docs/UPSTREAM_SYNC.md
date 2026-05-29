@@ -2,6 +2,21 @@
 
 How to bring `vendor/gdw` up to date with `EvolutionAPI/evolution-api:main` (or any newer upstream tag).
 
+> **Two independent axes.** Evolution and Baileys are bumped separately. Upstream Evolution (even 2.4.0/`develop`) pins `baileys@7.0.0-rc.9`, so a Baileys upgrade is *our* decision, not something inherited from an Evolution rebase. This file's "Procedure" section below covers the **Evolution rebase**; the "Baileys-only version bump" section covers the **Baileys** axis. The 2026-05-29 rc10→rc13 bump used the Baileys-only path — see `docs/BAILEYS_UPGRADE_rc10_to_rc13.md` for the worked example. Note: moving to Evolution 2.4.0 introduces a mandatory license-activation gate (#2530) — do not rebase onto 2.4.0 without a plan for it.
+
+## Baileys-only version bump
+
+When all you need is a newer Baileys (security fix, protocol fix) and you are staying on the current Evolution base:
+
+1. Bump the pin in `package.json` — keep it an **exact** pin (no caret); a caret on a prerelease lets a future `npm install` drift to a different rc and break the patch's version-match.
+2. `npm install baileys@<new-version>` to refresh `package-lock.json` (npm may re-add a caret — revert it).
+3. **Regenerate the patch.** `patch-package` matches `patches/baileys+<EXACT-installed-version>.patch`. The old file will not match the new version and silently no-ops (build succeeds, ships unpatched — the 2026-05-13-class trap). To regenerate: move the old patch aside, `git apply --check` it against the new `node_modules/baileys/lib` (if context matches, the compiled output is unchanged), apply it, then `npx patch-package baileys` to emit `baileys+<new-version>.patch`. `git rm` the old file.
+4. **Verify** the regenerated patch is semantically identical to the old one: `diff <(grep -vE '^index ' old.patch) <(grep -vE '^index ' new.patch)` should be empty (differences only in blob-hash `index` lines). If the source files changed between versions, re-apply the hunks by hand and re-confirm each `// [GDW]` block landed in the right function.
+5. **Confirm a clean `npm ci`** prints `baileys@<new-version> ✔` (this is the CI/Docker path). Then `npm run build` (tsc) and the Docker smoke below.
+6. **Before bumping, check the changed-file surface:** `git -C ../baileys-source log --oneline <old-tag>..<new-tag> -- src/Socket/messages-send.ts src/Utils/link-preview.ts src/Types/Message.ts`. Zero commits on those three = the patch will re-apply cleanly. Non-zero = expect to re-roll hunks by hand.
+
+The rest of this file (rebase, conflict hot-spots, smoke, deploy verification) applies to both axes.
+
 ## Cadence
 
 - **Monthly minimum.**

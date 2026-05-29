@@ -171,6 +171,23 @@ The full playbook for adding patches lives at `grupodewhatsapp/docs/evolution-fo
 
 ---
 
+## Baileys runtime patch (`patches/baileys+<version>.patch`)
+
+Applied by `patch-package` at `postinstall`. **Filename is version-pinned** — it must be `baileys+<EXACT-installed-version>.patch` or patch-package silently skips it (build succeeds, ships unpatched). The file bundles four logically independent concerns across three compiled Baileys files:
+
+| Concern | Compiled file | Consumed by |
+|---|---|---|
+| Outbound tracer L4 (`emitGdwTrace` + `relayMessage` `traceId`) | `lib/Socket/messages-send.js`, `lib/Types/Message.d.ts` | `outbound:trace` Redis stream + `scripts/trace-outbound.ts` (worker stamps `X-GDW-Trace-Id`) |
+| Empty-bubble SKDM defense (strip `conversation:''` before the spread) | `lib/Socket/messages-send.js` | protocol correctness — prevents blank group bubbles on sender-key redistribution |
+| viewOnce unwrap in `getMediaType` | `lib/Socket/messages-send.js` | Instagram-stories `view_once_video_then_link_reply` |
+| Link-preview WhatsApp UA + broken-image guard | `lib/Utils/link-preview.js` | affiliate/marketplace OG previews |
+
+- **2026-05-29:** bumped `7.0.0-rc10` → `7.0.0-rc13` (Critical CVE-2026-48063, fixed upstream in rc12; + rc11/13 protocol fixes). All three patched source files were untouched rc10→rc13, so the patch re-applied byte-identically (only the filename changed). Procedure: `docs/UPSTREAM_SYNC.md` → "Baileys-only version bump". Worked example: `docs/BAILEYS_UPGRADE_rc10_to_rc13.md`.
+
+> The fork carries more Evolution-source patches than the GDW-001..008 entries above (proxy-pool, send-media viewOnce/gifPlayback, send-text WAUrlInfo, the forensic/zombie-autoheal subsystem, reconnect-classifier, PostHog router). Those predate this registry's last full update and are tracked via their `// [GDW]` markers and commit messages; backfilling dedicated entries is a pending docs task.
+
+---
+
 ## Template for new patches
 
 ```markdown

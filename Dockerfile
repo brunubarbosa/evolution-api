@@ -13,8 +13,12 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 # patches/ must exist before npm ci so the postinstall hook (patch-package)
-# can apply our Baileys mutex-timeout patch on top of the freshly installed
-# node_modules. Without this, the build succeeds but ships unpatched Baileys.
+# can apply our Baileys patch (tracer L4, SKDM empty-bubble defense, viewOnce
+# getMediaType unwrap, link-preview UA + broken-image guard) on top of the
+# freshly installed node_modules. The patch file is named for the EXACT
+# baileys version (baileys+<version>.patch); a version bump that forgets to
+# rename it makes patch-package silently no-op — the build succeeds but ships
+# unpatched Baileys. Without this COPY, same silent-failure result.
 COPY ./patches ./patches
 
 RUN npm ci --silent
